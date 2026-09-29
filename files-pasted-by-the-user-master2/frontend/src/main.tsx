@@ -1,6 +1,7 @@
 import React, { Component, type ErrorInfo, type ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 import App from './App'
+import { AuthProvider } from './auth/AuthContext'
 import './style.css'
 
 class StartupBoundary extends Component<{children:ReactNode},{error:string|null}>{
@@ -15,4 +16,4 @@ class StartupBoundary extends Component<{children:ReactNode},{error:string|null}
 
 const root=document.getElementById('root')
 if(!root)throw new Error('Missing #root mount element')
-createRoot(root).render(<React.StrictMode><StartupBoundary><App /></StartupBoundary></React.StrictMode>)
+createRoot(root).render(<React.StrictMode><StartupBoundary><AuthProvider><App /></AuthProvider></StartupBoundary></React.StrictMode>)

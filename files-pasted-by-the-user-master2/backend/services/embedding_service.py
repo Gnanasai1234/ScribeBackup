@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from services.local_fallbacks import local_ollama_embeddings
+from services.openai_gateway import GatewayError, get_openai_gateway
 
 LOGGER = logging.getLogger("scribe.embeddings")
 
@@ -55,6 +57,7 @@ class EmbeddingService:
         self.groq_base_url = os.getenv("GROQ_API_BASE", "https://api.groq.com/openai/v1").strip()
         self.groq_model = os.getenv("GROQ_EMBEDDING_MODEL", "bge-small-en-v1.5").strip()
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        self.gateway = get_openai_gateway()
         self.last_status: dict[str, Any] = {}
 
     def get_embeddings(self, texts: list[str]) -> list[list[float]]:
@@ -66,40 +69,51 @@ class EmbeddingService:
         if not texts:
             return []
 
-        # If primary provider is groq
-        if self.provider == "groq" or (self.provider != "local" and self.groq_api_key):
+        if self.gateway.configured:
             try:
-                vectors = self._embed_groq(texts)
+                # The gateway contract takes one input string per request.
+                with ThreadPoolExecutor(max_workers=min(8, len(texts))) as executor:
+                    vectors = list(executor.map(self.gateway.embedding, texts))
+                if len(vectors) != len(texts) or any(not vector for vector in vectors):
+                    raise GatewayError("OpenAI Gateway returned an incomplete embedding batch.")
                 self.last_status = {
-                    "provider": "groq",
-                    "effective_provider": "groq",
-                    "model": self.groq_model,
+                    "provider": "openai-gateway",
+                    "effective_provider": "openai-gateway",
+                    "model": "gateway-managed",
                     "fallback_used": False,
                 }
                 return vectors
             except Exception as exc:
-                LOGGER.warning("Groq embeddings failed (%s); trying local multilingual fallback", type(exc).__name__)
-                return self._embed_local_fallback(texts, failure=exc)
+                LOGGER.warning("OpenAI Gateway embeddings failed type=%s; trying configured fallbacks", type(exc).__name__)
+                fallback_vectors = self._embed_configured_fallback(texts, failure=exc)
+                return fallback_vectors
 
-        # If openai provider is specified
+        return self._embed_configured_fallback(texts)
+
+    def _embed_configured_fallback(self, texts: list[str], failure: Exception | None = None) -> list[list[float]]:
+        """Retain configured provider and local fallbacks when the gateway is unavailable."""
+        if (self.provider == "groq" and self.groq_api_key) or (self.provider not in {"local", "groq", "openai"} and self.groq_api_key):
+            try:
+                vectors = self._embed_groq(texts)
+                self.last_status = {"provider": "groq", "effective_provider": "groq", "model": self.groq_model,
+                                    "fallback_used": failure is not None}
+                return vectors
+            except Exception as exc:
+                LOGGER.warning("Groq embeddings failed (%s); trying local embedding fallback", type(exc).__name__)
+
         if self.provider == "openai" and self.openai_api_key:
             try:
                 from openai import OpenAI
 
                 client = OpenAI(api_key=self.openai_api_key, timeout=float(os.getenv("EMBEDDING_TIMEOUT_SECONDS", "8")), max_retries=0)
                 resp = client.embeddings.create(input=texts, model="text-embedding-3-small")
-                self.last_status = {
-                    "provider": "openai",
-                    "effective_provider": "openai",
-                    "model": "text-embedding-3-small",
-                    "fallback_used": False,
-                }
+                self.last_status = {"provider": "openai", "effective_provider": "openai",
+                                    "model": "text-embedding-3-small", "fallback_used": failure is not None}
                 return [item.embedding for item in resp.data]
             except Exception as exc:
-                LOGGER.warning("OpenAI embeddings failed (%s); trying local multilingual fallback", type(exc).__name__)
-                return self._embed_local_fallback(texts, failure=exc)
+                LOGGER.warning("OpenAI embeddings failed (%s); trying local embedding fallback", type(exc).__name__)
 
-        return self._embed_local_fallback(texts)
+        return self._embed_local_fallback(texts, failure=failure)
 
     def get_embedding(self, text: str) -> list[float]:
         """Generate embedding for a single string."""
@@ -144,6 +158,7 @@ class EmbeddingService:
         """Status information for health checks and UI display."""
         return {
             "configured_provider": self.provider,
+            "gateway_configured": self.gateway.configured,
             "groq_configured": bool(self.groq_api_key),
             "fallback_available": True,
             "fallback_engine": "installed Ollama embedding, cached multilingual FastEmbed, then lexical retrieval",

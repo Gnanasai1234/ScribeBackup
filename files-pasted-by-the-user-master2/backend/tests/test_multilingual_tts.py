@@ -8,6 +8,8 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.main import DOCS, app
+from app import main
+from app.auth import get_current_user
 from services.tts_service import (
     estimate_timings,
     split_into_sentences,
@@ -18,9 +20,16 @@ from services.tts_service import (
 class MultilingualTtsTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
+        self.user = {"id": 765435, "name": "Test User", "email": "tts@example.com"}
+        app.dependency_overrides[get_current_user] = lambda: self.user
+        self.repo_patches = [patch.object(main, "save_document"), patch.object(main, "save_question"),
+                             patch.object(main, "find_duplicate_document", return_value=False),
+                             patch.object(main, "record_history")]
+        for item in self.repo_patches: item.start()
         self.doc_id = "test_doc_tts"
         DOCS[self.doc_id] = {
             "id": self.doc_id,
+            "user_id": self.user["id"],
             "name": "test.txt",
             "language": "en",
             "status": "ready",
@@ -41,6 +50,8 @@ class MultilingualTtsTests(unittest.TestCase):
         }
 
     def tearDown(self):
+        app.dependency_overrides.clear()
+        for item in self.repo_patches: item.stop()
         DOCS.pop(self.doc_id, None)
 
     def test_multilingual_sentence_splitting(self):

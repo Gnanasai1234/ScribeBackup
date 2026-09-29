@@ -1,4 +1,4 @@
-"""audio collection.
+"""audio table.
 
 Metadata about a generated narration. Never stores the audio binary --
 `audioUrl` points at the actual file. A summary can have multiple audio
@@ -10,13 +10,13 @@ from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
 
-from .common import PyObjectId
+from .common import RecordId
 
 
 class Audio(BaseModel):
-    id: PyObjectId | None = Field(default=None, alias="_id")
-    documentId: PyObjectId
-    summaryId: PyObjectId
+    id: RecordId | None = Field(default=None)
+    documentId: RecordId
+    summaryId: RecordId
     language: str
     voiceId: str
     voiceName: str

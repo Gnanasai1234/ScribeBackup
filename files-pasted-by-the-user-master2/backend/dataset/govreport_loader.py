@@ -1,4 +1,4 @@
-"""Bounded streaming access to GovReport; records are never persisted to MongoDB."""
+"""Bounded streaming access to GovReport; source records remain dataset-backed."""
 from __future__ import annotations
 
 import os

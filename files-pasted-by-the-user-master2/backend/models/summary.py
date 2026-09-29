@@ -1,4 +1,4 @@
-"""summaries collection.
+"""summaries table.
 
 One row per generated summary. A single document can have several
 summaries over time (different modes, languages, or re-runs).
@@ -10,14 +10,14 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .common import PyObjectId
+from .common import RecordId
 
 SummaryMode = Literal["quick", "standard", "deep", "auto", "custom"]
 
 
 class Summary(BaseModel):
-    id: PyObjectId | None = Field(default=None, alias="_id")
-    documentId: PyObjectId
+    id: RecordId | None = Field(default=None)
+    documentId: RecordId
     summaryMode: SummaryMode = "standard"
     resolvedDepth: Literal["quick", "standard", "deep"] = "standard"
     summaryType: str = "executive"

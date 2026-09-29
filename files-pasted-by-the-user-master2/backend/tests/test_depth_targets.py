@@ -125,7 +125,7 @@ class DepthTargetTests(unittest.TestCase):
                     notes = payload["source_notes"]
                     # Generate points reflecting prompt request
                     return {
-                        "findings": [{"text": f"Finding note {i}", "source_chunk_ids": [notes[0]["source_chunk_ids"][0]]} for i in range(len(notes))]
+                    "findings": [{"text": notes[i % len(notes)]["text"], "source_chunk_ids": [notes[i % len(notes)]["source_chunk_ids"][0]]} for i in range(len(notes))]
                     }
                 return {"results": [{"id": c["id"], "status": "SUPPORTED", "source_chunk_ids": c["cited_chunk_ids"], "reason": "Entailed."} for c in payload.get("claims", [])]}
 

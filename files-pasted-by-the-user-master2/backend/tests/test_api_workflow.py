@@ -9,9 +9,50 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastapi.testclient import TestClient
 from app.main import DOCS, app
+from app.auth import get_current_user
+from app import main
 
 
 class ApiWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.user = {"id": 765432, "name": "Test User", "email": "test@example.com"}
+        app.dependency_overrides[get_current_user] = lambda: self.user
+        self.repo_patches = [
+            patch.object(main, "save_document"), patch.object(main, "save_question"),
+            patch.object(main, "find_duplicate_document", return_value=False),
+            patch.object(main, "record_history"), patch.object(main, "save_combined_summary", return_value=1),
+            patch.object(main, "get_local_llm_service", return_value=None),
+            patch.object(main, "_get_fallback_llm_service", return_value=None),
+        ]
+        for item in self.repo_patches: item.start()
+
+    def tearDown(self):
+        app.dependency_overrides.clear()
+        for item in self.repo_patches: item.stop()
+
+    def test_primary_empty_response_uses_deterministic_summary_without_crashing(self):
+        client = TestClient(app)
+        text = "Quarterly inspections are required. The agency approved a two-year safety pilot."
+        keep_in_memory = lambda doc: DOCS.__setitem__(doc["id"], doc)
+        primary = type("Primary", (), {"provider_name": "sarvam", "model": "configured-model"})()
+        with patch("app.main.OpenRouterService", return_value=primary), \
+             patch("app.main.summarize_with_openrouter", side_effect=ValueError("sarvam returned an empty message")), \
+             patch("app.main.get_local_llm_service", return_value=None), \
+             patch("app.main._get_fallback_llm_service", return_value=None), \
+             patch("app.main.save_doc", side_effect=keep_in_memory):
+            uploaded = client.post("/api/documents/upload", files={"file": ("fallback.txt", text, "text/plain")})
+            self.assertEqual(uploaded.status_code, 200)
+            document_id = uploaded.json()["id"]
+            processed = client.post(f"/api/documents/{document_id}/process", json={"summary_depth": "quick", "language": "en"})
+        self.assertEqual(processed.status_code, 200)
+        result = processed.json()
+        self.assertTrue(result["executive_summary"])
+        self.assertEqual(result["provider"]["name"], "local extractive fallback")
+        self.assertEqual(result["provider_status"]["primary"], "FAILED (ValueError)")
+        self.assertEqual(result["provider_status"]["final"], "DETERMINISTIC EXTRACTIVE SUMMARY")
+        self.assertIn("The agency approved a two-year safety pilot.", result["executive_summary"])
+        DOCS.pop(document_id, None)
+
     def test_auto_and_failed_translation_preserve_detected_telugu(self):
         client = TestClient(app)
         telugu_text = "తెలుగు భాషలో ఈ పత్రం వివరమైన విశ్లేషణను అందిస్తుంది. సంస్థ కొత్త ప్రణాళికను ఆమోదించి అమలు ప్రారంభించింది."

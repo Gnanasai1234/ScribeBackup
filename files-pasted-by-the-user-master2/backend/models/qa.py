@@ -1,4 +1,4 @@
-"""qa collection.
+"""qa table.
 
 One row per question asked about a document via the "Ask the Document"
 feature. `sources` is a light pointer back to where the answer came
@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from pydantic import BaseModel, Field
 
-from .common import PyObjectId
+from .common import RecordId
 
 
 class QASource(BaseModel):
@@ -18,8 +18,8 @@ class QASource(BaseModel):
 
 
 class QuestionAnswer(BaseModel):
-    id: PyObjectId | None = Field(default=None, alias="_id")
-    documentId: PyObjectId
+    id: RecordId | None = Field(default=None)
+    documentId: RecordId
     question: str
     answer: str
     language: str = "en"

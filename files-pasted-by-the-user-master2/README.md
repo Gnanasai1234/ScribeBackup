@@ -1,10 +1,10 @@
 # Scribe — Document Intelligence MVP
 
-Scribe is a document intelligence prototype that uses Sarvam AI as its primary LLM for chunk-based analysis, structured summaries, claim validation, bounded regeneration, and evidence-grounded Q&A. OpenRouter and Groq can serve as configured secondary providers. Local extractive summarization and lexical evidence retrieval remain available as fallbacks.
+Scribe is a document intelligence prototype that uses a configured hosted LLM when its credentials are available and automatically falls back to an installed local Ollama model when they are missing or the provider fails. Local extractive summarization and lexical evidence retrieval remain available as final fallbacks. Speech transcription can use hosted Whisper when configured and automatically falls back to local Faster Whisper.
 
 ## What works
 
-- PDF, DOCX, TXT, JSON, JPG/JPEG, and PNG ingestion with a 25 MiB upload limit. Scanned PDF pages, pages containing embedded images, and standalone images are scanned with local Tesseract OCR when installed.
+- PDF, DOCX, TXT, CSV, JSON, JPG/JPEG, and PNG ingestion with a 25 MiB upload limit. Scanned PDF pages, pages containing embedded images, and standalone images are scanned with local Tesseract OCR when installed.
 - Text normalization, sentence-aware overlapping chunks, PDF page retention, OCR confidence and page provenance, and conservative script-based language detection for English, Hindi, Telugu, Tamil, and Kannada.
 - Quick, Standard, Deep, Auto, and Custom summary settings. The modes change context coverage, map-note detail, output structure, claim limits, and synthesis token budgets.
 - Structured summary fields, claim-level validation against cited source chunks, and up to two regeneration attempts.
@@ -13,12 +13,13 @@ Scribe is a document intelligence prototype that uses Sarvam AI as its primary L
 - Exact sentence additions/removals for document comparison.
 - Telugu, Hindi, and Tamil translation through the configured LLM when requested. Translated claims are checked against the original-language report again.
 - Language-matched speech from validated summaries: local system voices when available, with downloadable online neural MP3 playback for English, Hindi, Telugu, and Tamil.
+- A Local LLM Test workspace for text and voice prompts. Voice uses offline Faster Whisper transcription and sends the reviewed transcript through the configured local Ollama model.
 - Bounded GovReport streaming, in-memory report selection, reference-only ROUGE evaluation, and same-document Quick/Standard/Deep comparison.
 - Deterministic demo data and OpenAPI documentation.
 
 ## Current limits
 
-This is a runnable MVP, not the entire requested production platform. Sarvam AI is the primary generation provider when its API key is configured; OpenRouter and Groq are secondary providers. Embeddings, a vector database, MongoDB persistence, a background queue, authentication, and persistent audio history are not connected. OCR uses free local Tesseract and continues with any normally extracted text when OCR is unavailable. Speech can use local system voices or the optional Edge neural TTS service; online voice generation sends only the validated summary text to Microsoft for synthesis. GovReport records and references are held in process memory only; the reference summary is used only by evaluation. Claim validation is another model call using the same selected provider, so treat it as an automated check rather than independent human verification. Documents disappear when the API restarts.
+This is a runnable MVP, not the entire requested production platform. Sarvam AI is the primary generation provider when its API key is configured; OpenRouter and Groq are secondary providers. Scribe now has email/password accounts and signed cookie sessions, with each document assigned to its uploader. Embeddings, a vector database, a background queue, and persistent generated audio files are not connected. Document and analysis persistence uses MySQL configured through `DATABASE_URL`; see [docs/database.md](docs/database.md). OCR uses free local Tesseract and continues with any normally extracted text when OCR is unavailable. Speech can use local system voices or the optional Edge neural TTS service; online voice generation sends only the validated summary text to Microsoft for synthesis. GovReport records and references are held on the selected dataset document; the reference summary is used only by evaluation. Claim validation is another model call using the same selected provider, so treat it as an automated check rather than independent human verification.
 
 ## Requirements
 
@@ -45,7 +46,16 @@ npm install
 npm run dev
 ```
 
-Before starting the backend, set `LLM_PROVIDER=sarvam` and `SARVAM_API_KEY` in `.env`. The default primary model is `sarvam-105b` at `https://api.sarvam.ai/v1`. OpenRouter (`OPENROUTER_API_KEY`) and Groq (`GROQ_API_KEY`) remain available as secondary providers. The configured provider can be selected with `LLM_PROVIDER`; fallback to local summarization remains available.
+Before starting the backend, set `SESSION_SECRET` to a random value of at least 32 characters in `.env`, and configure your existing `DATABASE_URL`. Generate a secret in PowerShell with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Hosted LLM and Whisper API keys are optional. With no usable hosted LLM key, Scribe uses an already-installed model selected by `OLLAMA_MODEL` (defaults to `llama3.2:1b`) at `OLLAMA_BASE_URL` (defaults to `http://127.0.0.1:11434`). Make sure Ollama is running and the model has already been pulled. Without `OPENAI_API_KEY`, speech transcription uses the already-cached Faster Whisper model selected by `LOCAL_STT_MODEL` (defaults to `base`); it does not download a model during a request. Provider selection and fallback are logged by the backend.
+
+Apply database changes from the backend directory with `alembic upgrade head`. The migrations add `users`, a nullable `documents.user_id`, and per-user upload/text hash indexes for duplicate detection; existing documents stay unassigned until you choose them. To assign selected legacy rows to an account, first create that account through Register, then run a deliberate MySQL update, replacing the email and IDs with your choices:
+
+```sql
+UPDATE documents
+SET user_id = (SELECT id FROM users WHERE email = LOWER(TRIM('alice@example.com')))
+WHERE id IN ('document-id-one', 'document-id-two')
+  AND user_id IS NULL;
+```
 
 ```powershell
 Copy-Item .env.example .env
@@ -54,7 +64,7 @@ notepad .env
 
 With Sarvam configured, extracted document chunks are sent to Sarvam AI for analysis, validation, and Q&A. Provider requests can incur usage charges. Check the selected model and provider data handling settings before processing sensitive files.
 
-Open `http://127.0.0.1:5173`. API docs are at `http://127.0.0.1:8000/docs`. The demo button loads a fictional transit review using the deterministic local pipeline without calling OpenRouter.
+Open `http://localhost:5173` so the frontend and API use the same site for the session cookie. API docs are at `http://localhost:8000/docs`. The demo button loads a fictional transit review using the deterministic local pipeline without calling OpenRouter.
 
 
 ## Local OCR setup (Windows)
@@ -112,6 +122,8 @@ OCR text is merged into the document's normal page text before chunking, summari
 
 See [.env.example](.env.example). Keep `.env` on the backend and never place the OpenRouter key in frontend configuration. Without a Sarvam key, the configured OpenRouter or Groq secondary provider is used when available; otherwise, uploaded documents use the local extractive fallback. `GOVREPORT_DATASET_ID`, `GOVREPORT_SPLIT`, `GOVREPORT_DEV_LIMIT`, `GOVREPORT_EVALUATION_LIMIT`, and optional `GOVREPORT_CACHE_DIR` configure bounded dataset streaming. `SUMMARY_MAX_REGENERATION_ATTEMPTS` sets the retry limit. `EMBEDDING_PROVIDER` and `VECTOR_DB_URL` are currently configuration placeholders and do not activate vector retrieval.
 
+Voice prompts use `LOCAL_STT_MODEL` (defaults to `base`) through Faster Whisper on the backend CPU. The selected model must already be present in the local Hugging Face cache; transcription runs with offline-only model loading and does not call a paid speech API. `LOCAL_STT_DEVICE` and `LOCAL_STT_COMPUTE_TYPE` can override the default `cpu` and `int8` settings.
+
 ## API and schemas
 
 See [API reference](docs/api.md), [OpenRouter setup and request flow](docs/openrouter.md), [schema notes](docs/schema.md), and the generated OpenAPI UI. The architecture diagram and trust boundaries are in [architecture/architecture.md](architecture/architecture.md).
@@ -128,4 +140,4 @@ Build the frontend with `cd frontend; npm run build`.
 
 ## Next production steps
 
-Connect MongoDB and the configured vector service, add OCR and persistent audio history, move processing to a job worker, and add access control and observability. Semantic similarity and several reference-independent quality metrics are currently reported as unavailable rather than estimated.
+Connect the configured vector service, add persistent audio file storage, move processing to a job worker, and add observability. Semantic similarity and several reference-independent quality metrics are currently reported as unavailable rather than estimated.

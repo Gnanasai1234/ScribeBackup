@@ -1,4 +1,4 @@
-"""feedback collection.
+"""feedback table.
 
 User feedback on a specific piece of output (summary, audio, or a QA
 answer) for a document.
@@ -10,14 +10,14 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .common import PyObjectId
+from .common import RecordId
 
 FeedbackType = Literal["summary", "audio", "qa"]
 
 
 class Feedback(BaseModel):
-    id: PyObjectId | None = Field(default=None, alias="_id")
-    documentId: PyObjectId
+    id: RecordId | None = Field(default=None)
+    documentId: RecordId
     type: FeedbackType
     rating: int = Field(ge=1, le=5)
     feedback: str | None = None

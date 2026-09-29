@@ -31,18 +31,31 @@ def summarization_agent(state: AnalysisState, summarize: Callable[[dict[str, Any
 def summary_validation_agent(state: AnalysisState) -> AnalysisState:
     result = state["result"] or {}
     claims = result.get("claims", [])
+    fallback_state = (
+        "VALIDATED" if result.get("validation_status") == "passed" else
+        "NO_CLAIMS" if result.get("validation_status") == "no_claims" else
+        "VALIDATION_UNAVAILABLE" if result.get("validation_status") == "unavailable" else
+        "PARTIALLY_VALIDATED"
+    )
     state["result"] = result | {
         "validation": {
             "status": result.get("validation_status", result.get("status", "unavailable")),
+            "state": result.get("validation_state", fallback_state),
+            "warning": result.get("validation_warning", False),
+            "warning_message": result.get("warning_message"),
             "source_of_truth": "original_document_chunks",
             "language_context": state["document"].get("language_context"),
             "provider": result.get("validation_provider", "configured_provider"),
             "claims_checked": len(claims),
             "supported_claims": sum(c.get("status") == "SUPPORTED" for c in claims),
-            "unsupported_claims": sum(c.get("status") == "UNSUPPORTED" for c in claims),
+            "unsupported_claims": sum(c.get("status") in {"UNSUPPORTED", "PARTIALLY_SUPPORTED", "UNCERTAIN"} for c in claims),
             "attempts": result.get("stats", {}).get("validation_attempts", 0),
             "max_attempts": result.get("stats", {}).get("max_validation_attempts", 3),
-            "max_attempts_reached": result.get("stats", {}).get("validation_attempts", 0) >= result.get("stats", {}).get("max_validation_attempts", 3) and result.get("validation_status") not in {"passed", "no_claims"},
+            "max_attempts_reached": (
+                result.get("stats", {}).get("validation_attempts", 0) > 0
+                and result.get("stats", {}).get("validation_attempts", 0)
+                >= result.get("stats", {}).get("max_validation_attempts", 3)
+            ),
         }
     }
     state["node_history"].append("summary_validation")

@@ -93,6 +93,34 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("UNTRUSTED", result["executive_summary"])
         self.assertEqual(result["claims"][0]["sources"][0]["chunk_id"], "chunk_001")
 
+    def test_local_ollama_summary_keeps_only_source_supported_claims(self):
+        import json
+
+        class FakeOllama:
+            provider_name = "ollama-local"
+            model = "llama3.2:1b"
+            def __init__(self): self.calls = 0
+            def complete_json(self, system, user, **kwargs):
+                self.calls += 1
+                payload = json.loads(user)
+                if "passages" in payload:
+                    passage = payload["passages"][0]
+                    return {"notes": [{"text": passage["text"], "source_chunk_ids": [passage["chunk_id"]]}]}
+                return {
+                    "executive_summary": "Unsupported draft text must not appear.",
+                    "findings": [{"text": "The board approved a two-year service pilot.", "source_chunk_ids": ["chunk_001"]}],
+                    "risks": [{"text": "The software platform has major security weaknesses.", "source_chunk_ids": ["chunk_001"]}],
+                }
+
+        text = "The board approved a two-year service pilot."
+        doc = {"text": text, "chunks": [{"id": "chunk_001", "text": text, "page": 1, "section": "Decision", "language": "en"}], "pages": [], "language": "en"}
+        service = FakeOllama()
+        result = summarize_with_openrouter(doc, ProcessOptions(summary_depth="quick"), service)
+        self.assertEqual(service.calls, 2, "local provider should map and synthesize without repeated model self-validation")
+        self.assertEqual(result["executive_summary"], text)
+        self.assertEqual([claim["claim"] for claim in result["claims"]], [text])
+        self.assertTrue(all(claim["status"] == "SUPPORTED" for claim in result["claims"]))
+
     def test_openrouter_depth_changes_context_prompt_and_generation_capacity(self):
         import json
 

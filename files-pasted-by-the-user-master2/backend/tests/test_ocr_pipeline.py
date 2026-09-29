@@ -9,14 +9,23 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import main
+from app.auth import get_current_user
 
 
 class OcrPipelineTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(main.app)
+        self.user = {"id": 765434, "name": "Test User", "email": "ocr@example.com"}
+        main.app.dependency_overrides[get_current_user] = lambda: self.user
+        self.repo_patches = [patch.object(main, "save_document"), patch.object(main, "save_question"),
+                             patch.object(main, "find_duplicate_document", return_value=False),
+                             patch.object(main, "record_history")]
+        for item in self.repo_patches: item.start()
         self.created_ids = []
 
     def tearDown(self):
+        main.app.dependency_overrides.clear()
+        for item in self.repo_patches: item.stop()
         for document_id in self.created_ids:
             main.DOCS.pop(document_id, None)
 
@@ -34,7 +43,7 @@ class OcrPipelineTests(unittest.TestCase):
         with patch.object(main, "extract_image_ocr", return_value=mock_ocr), patch.object(main, "save_doc", side_effect=self.remember_doc):
             response = self.client.post("/api/documents/upload", files={"file": ("chart.png", output.getvalue(), "image/png")})
         self.assertEqual(response.status_code, 200)
-        doc = main.get_doc(response.json()["id"])
+        doc = main.get_doc(response.json()["id"], self.user)
         self.assertIn("Annual revenue increased by 24 percent.", doc["text"])
         self.assertEqual(doc["ocr_records"][0]["ocr_confidence"], 91.4)
         self.assertIn("Annual revenue increased by 24 percent.", " ".join(c["text"] for c in doc["chunks"]))
@@ -46,9 +55,9 @@ class OcrPipelineTests(unittest.TestCase):
         with patch.object(main, "extract_text", return_value=("", [page])), \
              patch.object(main, "extract_pdf_ocr", return_value=([{"page": 1, "text": "[Image 1 OCR] Revenue rose 24 percent."}], [{"page": 1, "source": "image", "text": "Revenue rose 24 percent.", "ocr_confidence": 88.0}], [])), \
              patch.object(main, "save_doc", side_effect=self.remember_doc):
-            response = self.client.post("/api/documents/upload", files={"file": ("scan.pdf", b"mock-pdf", "application/pdf")})
+            response = self.client.post("/api/documents/upload", files={"file": ("scan.pdf", b"%PDF-mock", "application/pdf")})
         self.assertEqual(response.status_code, 200)
-        doc = main.get_doc(response.json()["id"])
+        doc = main.get_doc(response.json()["id"], self.user)
         self.assertIn("Revenue rose 24 percent.", doc["text"])
         self.assertEqual(doc["chunks"][0]["page"], 1)
         self.assertEqual(doc["ocr_records"][0]["ocr_confidence"], 88.0)
@@ -79,9 +88,9 @@ class OcrPipelineTests(unittest.TestCase):
         with patch.object(main, "extract_text", return_value=(normal_text, pages)), \
              patch.object(main, "extract_pdf_ocr", return_value=(pages, [], [warning])), \
              patch.object(main, "save_doc", side_effect=self.remember_doc):
-            response = self.client.post("/api/documents/upload", files={"file": ("mixed.pdf", b"mock-pdf", "application/pdf")})
+            response = self.client.post("/api/documents/upload", files={"file": ("mixed.pdf", b"%PDF-mock", "application/pdf")})
         self.assertEqual(response.status_code, 200)
-        doc = main.get_doc(response.json()["id"])
+        doc = main.get_doc(response.json()["id"], self.user)
         self.assertIn("native PDF paragraph", doc["text"])
         self.assertEqual(doc["ocr_warnings"], [warning])
 

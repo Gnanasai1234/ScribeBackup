@@ -341,7 +341,7 @@ class TranslationPipelineTests(unittest.TestCase):
         result = summarize_with_openrouter(doc, ProcessOptions(language="en"), service)
         self.assertEqual(result["language"], "en")
         self.assertEqual(result["validation_status"], "unavailable")
-        self.assertEqual(result["claims"][0]["status"], "UNAVAILABLE")
+        self.assertEqual(result["claims"][0]["status"], "UNCERTAIN")
         self.assertTrue(result["executive_summary"])
         self.assertEqual(result["stats"]["regeneration_count"], 0)
         self.assertEqual(result["stats"]["validation_attempts"], 3)
