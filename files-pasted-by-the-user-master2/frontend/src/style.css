@@ -270,3 +270,85 @@
 .document-search-empty small{color:#82948b;font-size:10px}
 .document-search-empty .secondary-btn{margin-top:5px}
 @media(max-width:600px){.document-search{margin:14px 0;padding:12px}.document-search-control{min-height:42px}.document-search-control input{font-size:11px}.document-search-control input::placeholder{font-size:10px}}
+
+/* Redesigned Semantic Document Comparison Styles */
+.compare-container{display:grid;gap:18px;max-width:1080px;margin-top:20px}
+.compare-meta-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.compare-doc-card{border:1px solid #1e3629;background:linear-gradient(145deg,#0e1c16,#0a1511);border-radius:10px;padding:16px}
+.compare-doc-card.doc-b{border-color:#2a4d39}
+.compare-doc-header{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.compare-doc-header .file-icon{width:32px;height:32px}
+.compare-doc-title{font-size:12px;font-weight:600;color:#edf6f0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.compare-doc-tag{font:9px 'DM Mono',monospace;letter-spacing:1px;color:#74e3a5;text-transform:uppercase}
+.compare-doc-badges{display:flex;flex-wrap:wrap;gap:8px}
+.compare-pill{font:9px 'DM Mono',monospace;padding:4px 8px;border-radius:14px;background:#11231a;border:1px solid #234332;color:#9bc9ad}
+
+.compare-exec-card{border:1px solid #244131;background:linear-gradient(145deg,#0d1c16,#08130f);border-radius:12px;padding:22px}
+.compare-exec-card h3{margin:0 0 8px;font-size:15px;color:#ebf5ee}
+.compare-exec-card p{margin:0 0 16px;color:#cbdad0;font-size:12px;line-height:1.7}
+.compare-stats-pills{display:flex;flex-wrap:wrap;gap:8px}
+.stat-pill{padding:5px 10px;border-radius:6px;font:10px 'DM Mono',monospace;background:#0c1713;border:1px solid #1f3529;color:#92a499}
+.stat-pill b{color:#d5e6db;margin-right:4px}
+.stat-pill.modified{border-color:#b7791f;color:#e6b360;background:#241a0d}
+.stat-pill.modified b{color:#f5c87a}
+.stat-pill.added{border-color:#2e754f;color:#70e1a4;background:#0f2b1d}
+.stat-pill.added b{color:#8ff5be}
+.stat-pill.removed{border-color:#823b2d;color:#fca595;background:#2b140f}
+.stat-pill.removed b{color:#ffb8aa}
+.stat-pill.moved{border-color:#2a597a;color:#74c0f2;background:#0e2130}
+.stat-pill.moved b{color:#8bd0fa}
+
+.compare-alert-unrelated{display:flex;gap:12px;align-items:flex-start;padding:14px 16px;border-radius:9px;background:#2d1b15;border:1px solid #944a39;color:#ffd0c4;margin-bottom:14px;font-size:11px;line-height:1.6}
+.compare-alert-unrelated svg{color:#ff7d63;flex-shrink:0;margin-top:2px}
+.compare-alert-unrelated b{color:#ffe4dc;display:block;margin-bottom:3px}
+
+.compare-important-card{border:1px solid #334d3c;background:#0f2219;border-radius:10px;padding:16px}
+.compare-important-card h4{margin:0 0 10px;font-size:12px;color:#9be9bc;display:flex;align-items:center;gap:7px}
+.compare-important-list{list-style:none;padding:0;margin:0;display:grid;gap:7px}
+.compare-important-list li{display:flex;align-items:flex-start;gap:9px;font-size:11px;color:#d2dfd5;line-height:1.5}
+.compare-important-list li span.dot{width:6px;height:6px;border-radius:50%;background:#50d98f;margin-top:5px;flex-shrink:0}
+
+.compare-tabs{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;border-bottom:1px solid #1a2d23}
+.compare-tab{border:1px solid transparent;background:transparent;color:#85968d;padding:8px 12px;border-radius:6px;font-size:11px;cursor:pointer;display:flex;align-items:center;gap:6px;transition:.15s}
+.compare-tab:hover{color:#eff8f2;background:#102219}
+.compare-tab.active{border-color:#2f533e;background:#14291e;color:#89e8b1;font-weight:600}
+.compare-tab-count{font:9px 'DM Mono',monospace;padding:2px 6px;border-radius:10px;background:#193527;color:#a3ceb4}
+
+.compare-item-card{border:1px solid #1e3328;background:#0c1713;border-radius:10px;padding:16px;display:grid;gap:12px}
+.compare-item-card.is-modified{border-left:4px solid #d4953c}
+.compare-item-card.is-added{border-left:4px solid #43ca83}
+.compare-item-card.is-removed{border-left:4px solid #de5743}
+.compare-item-card.is-moved{border-left:4px solid #479ee3}
+.compare-item-card.is-unchanged{border-left:4px solid #375344}
+
+.compare-item-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.compare-item-title{font-size:12px;font-weight:600;color:#e8f4ec}
+.compare-status-badge{font:9px 'DM Mono',monospace;padding:3px 7px;border-radius:4px;text-transform:uppercase;font-weight:600}
+.status-badge-modified{background:#382711;color:#f0b965;border:1px solid #754c1b}
+.status-badge-added{background:#113320;color:#67e5a0;border:1px solid #23693e}
+.status-badge-removed{background:#331411;color:#fa9284;border:1px solid #6b261e}
+.status-badge-moved{background:#11283a;color:#78c7f8;border:1px solid #214f73}
+.status-badge-unchanged{background:#14221b;color:#85998e;border:1px solid #233b2e}
+.status-badge-translated{background:#261836;color:#cca6f8;border:1px solid #573380}
+.status-badge-uncertain{background:#262314;color:#edd987;border:1px solid #665b26}
+
+.compare-columns{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.compare-col{background:#09120f;border:1px solid #1a2a22;border-radius:7px;padding:12px}
+.compare-col-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font:9px 'DM Mono',monospace;color:#7f9187}
+.compare-col-text{font-size:11px;line-height:1.7;color:#d3dfd6;margin:0}
+.compare-col-text.dimmed{color:#829288;text-decoration:line-through;opacity:.75}
+.compare-col-text.empty-text{color:#64736b;font-style:italic}
+
+.compare-value-diff{display:flex;align-items:center;gap:9px;padding:8px 12px;border-radius:6px;background:#1b251a;border:1px solid #365437;color:#a8e0b6;font-size:11px}
+.compare-value-diff b{color:#67e5a0}
+.compare-explanation{font-size:11px;color:#a8b8ae;line-height:1.6;margin:0}
+.compare-context-btn{border:0;background:transparent;color:#74e3a5;font:10px 'DM Sans',sans-serif;cursor:pointer;padding:0;display:flex;align-items:center;gap:5px;align-self:start}
+.compare-context-drawer{margin-top:6px;padding:12px;border-radius:6px;background:#08100d;border:1px solid #17271f;font-size:10px;line-height:1.6;color:#91a397}
+.compare-context-drawer small{display:block;font:8px 'DM Mono',monospace;color:#677b70;margin-bottom:3px;text-transform:uppercase}
+.compare-confidence{font:8px 'DM Mono',monospace;color:#6d8276;text-align:right}
+
+@media(max-width:768px){
+  .compare-meta-grid{grid-template-columns:1fr}
+  .compare-columns{grid-template-columns:1fr}
+}
+

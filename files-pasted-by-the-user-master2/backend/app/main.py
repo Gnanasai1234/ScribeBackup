@@ -51,6 +51,7 @@ from services.tts_service import (
     estimate_timings,
 )
 from services.embedding_service import cosine_similarity, get_embedding_service
+from services.document_comparison import perform_document_comparison
 from services.openai_gateway import get_openai_gateway
 from services.local_fallbacks import get_local_llm_service
 from services.speech_to_text import (
@@ -1739,23 +1740,80 @@ def audio(doc_id: str, payload: AudioRequest, current_user: dict[str, Any] = Dep
 
 
 @app.post("/api/documents/compare")
-async def compare(file_a: UploadFile = File(...), file_b: UploadFile = File(...), current_user: dict[str, Any] = Depends(get_current_user)):
-    a, b = await file_a.read(MAX_BYTES + 1), await file_b.read(MAX_BYTES + 1)
-    total_limit = config_int("MAX_TOTAL_UPLOAD_MB", 50) * 1024 * 1024
-    if max(len(a), len(b)) > MAX_BYTES or len(a) + len(b) > total_limit:
-        raise HTTPException(413, "The upload batch exceeds the configured size limit.")
-    try:
-        info_a = validate_upload(file_a.filename or "", a)
-        info_b = validate_upload(file_b.filename or "", b)
-    except (ValueError, OverflowError) as exc:
-        raise HTTPException(400, "One of the comparison files is invalid or unsupported.") from exc
-    if info_a["sha256"] == info_b["sha256"]:
-        raise HTTPException(409, "The same document was selected twice.")
-    ta, _ = extract_text(info_a["name"], a)
-    tb, _ = extract_text(info_b["name"], b)
+async def compare(
+    file_a: UploadFile | None = File(None),
+    file_b: UploadFile | None = File(None),
+    doc_id_a: str | None = Form(None),
+    doc_id_b: str | None = Form(None),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    ta, tb = "", ""
+    pages_a: list[dict[str, Any]] = []
+    pages_b: list[dict[str, Any]] = []
+    info_a: dict[str, Any] = {}
+    info_b: dict[str, Any] = {}
+
+    if doc_id_a and doc_id_b:
+        doc_a = get_doc(doc_id_a, current_user)
+        doc_b = get_doc(doc_id_b, current_user)
+        ta, pages_a = doc_a.get("text", ""), doc_a.get("pages", [])
+        tb, pages_b = doc_b.get("text", ""), doc_b.get("pages", [])
+        info_a = {"name": doc_a["name"], "sha256": doc_a.get("content_sha256", doc_id_a)}
+        info_b = {"name": doc_b["name"], "sha256": doc_b.get("content_sha256", doc_id_b)}
+    elif file_a and file_b:
+        a, b = await file_a.read(MAX_BYTES + 1), await file_b.read(MAX_BYTES + 1)
+        total_limit = config_int("MAX_TOTAL_UPLOAD_MB", 50) * 1024 * 1024
+        if max(len(a), len(b)) > MAX_BYTES or len(a) + len(b) > total_limit:
+            raise HTTPException(413, "The upload batch exceeds the configured size limit.")
+        try:
+            info_a = validate_upload(file_a.filename or "", a)
+            info_b = validate_upload(file_b.filename or "", b)
+        except (ValueError, OverflowError) as exc:
+            raise HTTPException(400, "One of the comparison files is invalid or unsupported.") from exc
+        if info_a["sha256"] == info_b["sha256"]:
+            raise HTTPException(409, "The same document was selected twice.")
+        ta, pages_a = extract_text(info_a["name"], a)
+        tb, pages_b = extract_text(info_b["name"], b)
+    else:
+        raise HTTPException(422, "Provide either two files (file_a and file_b) or two document IDs (doc_id_a and doc_id_b).")
+
     ta, tb = validate_document_text(normalize(ta)), validate_document_text(normalize(tb))
-    sa, sb = set(re.findall(r"[^.!?\n]+[.!?]?", normalize(ta))), set(re.findall(r"[^.!?\n]+[.!?]?", normalize(tb)))
-    return {"added": sorted(s.strip() for s in sb-sa if s.strip()), "removed": sorted(s.strip() for s in sa-sb if s.strip()), "method": "exact sentence comparison", "limitations": "No semantic change classification is configured."}
+    lang_a = detect_language(ta)
+    lang_b = detect_language(tb)
+
+    llm_service = None
+    try:
+        llm_service = OpenRouterService()
+    except Exception:
+        llm_service = _get_fallback_llm_service()
+
+    result = perform_document_comparison(
+        doc_a_info=info_a,
+        doc_b_info=info_b,
+        text_a=ta,
+        text_b=tb,
+        pages_a=pages_a,
+        pages_b=pages_b,
+        lang_a=lang_a,
+        lang_b=lang_b,
+        llm_service=llm_service,
+    )
+
+    try:
+        record_history(
+            user_id=int(current_user["id"]),
+            activity_type="document_comparison",
+            title=f"Compare: {info_a['name']} vs {info_b['name']}",
+            status="COMPLETED",
+            input_text=f"A: {info_a['name']} ({result['document_a']['language']}) | B: {info_b['name']} ({result['document_b']['language']})",
+            output_text=result["executive_summary"],
+            language=result["document_a"]["language_code"],
+            extra_data=result,
+        )
+    except Exception as exc:
+        LOGGER.warning("Failed to record comparison history: %s", exc)
+
+    return result
 
 
 @app.get("/api/evaluation/{doc_id}")
