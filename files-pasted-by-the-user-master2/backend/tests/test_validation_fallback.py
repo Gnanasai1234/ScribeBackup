@@ -12,7 +12,7 @@ from docx import Document
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.main import ProcessOptions, make_chunks
-from app.openrouter import OpenRouterService, summarize_with_openrouter
+from app.llm_service import LLMService, summarize_document
 from services.summary_export import make_export_payload, render_summary
 
 
@@ -27,13 +27,13 @@ class ValidationFallbackTests(unittest.TestCase):
             "pages": [],
             "language": "en",
         }
-        service = MagicMock(spec=OpenRouterService)
-        service.provider_name = "openrouter"
+        service = MagicMock(spec=LLMService)
+        service.provider_name = "openai-gateway"
         service.model = "mock"
         validation_calls = 0
         regeneration_count = 0
 
-        def complete_json(system, user, max_tokens=1800):
+        def complete_json(system, user, max_tokens=1800, **kwargs):
             nonlocal validation_calls, regeneration_count
             if "Extract source-grounded notes" in system:
                 return {"notes": [{"text": source, "source_chunk_ids": ["chunk_001"]}]}
@@ -55,7 +55,7 @@ class ValidationFallbackTests(unittest.TestCase):
         service.complete_json.side_effect = complete_json
         env = {"SUMMARY_MAX_REGENERATION_ATTEMPTS": "2", "MAX_VALIDATION_RETRIES": "2"}
         with patch.dict("os.environ", env):
-            result = summarize_with_openrouter(document, ProcessOptions(language="te"), service)
+            result = summarize_document(document, ProcessOptions(language="te"), service)
 
         self.assertEqual(validation_calls, 3)
         self.assertEqual(regeneration_count, 2)

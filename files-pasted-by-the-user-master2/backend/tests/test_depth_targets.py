@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.main import ProcessOptions, make_chunks, process_extractively, resolve_summary_depth
-from app.openrouter import summarize_with_openrouter
+from app.llm_service import summarize_document
 
 
 class DepthTargetTests(unittest.TestCase):
@@ -107,8 +107,8 @@ class DepthTargetTests(unittest.TestCase):
         self.assertEqual(cleared["validation_status"], "no_claims")
         self.assertTrue(cleared["executive_summary"])
 
-    def test_openrouter_prompt_and_tokens_for_all_modes(self):
-        """Test OpenRouter prompt mode and max_tokens allowances across quick, standard, deep, and auto."""
+    def test_llm_prompt_and_tokens_for_all_modes(self):
+        """Test OpenAI prompt mode and max_tokens allowances across quick, standard, deep, and auto."""
         import json
 
         class CaptureService:
@@ -133,19 +133,19 @@ class DepthTargetTests(unittest.TestCase):
         doc = {"text": self.long_text, "chunks": make_chunks(self.long_text, []), "pages": [], "language": "en"}
 
         # Quick
-        summarize_with_openrouter(doc, ProcessOptions(summary_depth="quick"), service)
+        summarize_document(doc, ProcessOptions(summary_depth="quick"), service)
         quick_call = [c for c in service.calls if "source_notes" in c[1]][-1]
         self.assertIn("10 to 15", quick_call[1]["depth_requirements"])
         self.assertGreaterEqual(quick_call[2], 2800)
 
         # Standard
-        summarize_with_openrouter(doc, ProcessOptions(summary_depth="standard"), service)
+        summarize_document(doc, ProcessOptions(summary_depth="standard"), service)
         std_call = [c for c in service.calls if "source_notes" in c[1]][-1]
         self.assertIn("20 to 30", std_call[1]["depth_requirements"])
         self.assertGreaterEqual(std_call[2], 4500)
 
         # Deep
-        summarize_with_openrouter(doc, ProcessOptions(summary_depth="deep"), service)
+        summarize_document(doc, ProcessOptions(summary_depth="deep"), service)
         deep_call = [c for c in service.calls if "source_notes" in c[1]][-1]
         self.assertIn("40 to 60+", deep_call[1]["depth_requirements"])
         self.assertGreaterEqual(deep_call[2], 7500)

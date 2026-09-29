@@ -33,16 +33,13 @@ from database.repositories import (database_schema_status, get_document as load_
     save_document_chunk_embeddings,
     create_upload_batch, update_upload_batch, get_upload_batch, record_history, list_history as list_history_from_db,
     list_history_documents as list_history_documents_from_db,
-    save_combined_summary, get_combined_summary)
+    save_combined_summary, get_combined_summary, get_latest_summary_evaluation)
 from .auth import router as auth_router, get_current_user
 
-from .openrouter import OpenRouterService, _get_fallback_llm_service, answer_with_openrouter, summarize_with_openrouter, translate_for_audio
+from .llm_service import LLMGenerationError, LLMService, OpenAIGatewayProvider, GeminiProvider, answer_from_evidence, summarize_document, translate_for_audio
 from models.language_context import LanguageContext
 from .textmatch import term_hits, term_present
 from workflow.analysis import run_analysis_workflow
-from dataset.govreport_evaluator import evaluate_record
-from dataset.govreport_loader import SPLITS as GOVREPORT_SPLITS, get_record as get_govreport_record, stream_records as stream_govreport_records
-from dataset.govreport_service import to_document as govreport_to_document
 from services.tts_service import (
     synthesize as synthesize_audio,
     synthesize_with_timings,
@@ -52,8 +49,8 @@ from services.tts_service import (
 )
 from services.embedding_service import cosine_similarity, get_embedding_service
 from services.document_comparison import perform_document_comparison
-from services.openai_gateway import get_openai_gateway
 from services.local_fallbacks import get_local_llm_service
+from services.summary_evaluation import evaluate_summary
 from services.speech_to_text import (
     AudioRecordingEmpty,
     InvalidAudioRecording,
@@ -62,7 +59,7 @@ from services.speech_to_text import (
     transcribe_local_audio,
 )
 from services.ocr_service import configure_tesseract, extract_image_ocr, extract_pdf_ocr, ocr_status
-from services.guardrails import config_int, validate_upload, validate_document_text
+from services.guardrails import config_int, validate_upload, validate_document_text, is_usable_summary, summary_text
 from services.summary_export import (
     ExportTooLarge,
     SUPPORTED_EXPORT_FORMATS,
@@ -89,7 +86,7 @@ LANGUAGES = {
 }
 AUTO_LANGUAGE_VALUES = {"", "auto", "original", "source"}
 DOCS: dict[str, dict[str, Any]] = {}
-LOGGER = logging.getLogger("scribe.openrouter")
+LOGGER = logging.getLogger("scribe.llm")
 TTS_LOGGER = logging.getLogger("scribe.tts")
 
 
@@ -127,7 +124,7 @@ async def app_lifespan(_: FastAPI):
             f"missing_tables={database_status['missing_tables']} "
             f"missing_columns={database_status['missing_columns']} "
             f"configured_database={database_status['configured_database']!r}. "
-            "Run `..\\venv\\Scripts\\alembic.exe upgrade head` from the backend directory."
+            "Run `.\\venv\\Scripts\\alembic.exe upgrade head` from the backend directory."
         )
     LOGGER.info("Database schema ready (%d mapped tables).", database_status["required_table_count"])
     await verify_tesseract_at_startup()
@@ -249,16 +246,6 @@ class AudioRequest(BaseModel):
     rate: float = Field(default=1.0, ge=0.7, le=1.3)
 
 
-class EvaluationRunRequest(BaseModel):
-    document_id: str
-
-
-class DepthComparisonRequest(BaseModel):
-    purpose: str = "Executive briefing"
-    audience: str = "Leadership"
-    language: str = "auto"
-
-
 class BatchProcessRequest(BaseModel):
     document_ids: list[str] = Field(min_length=1)
     options: ProcessOptions = Field(default_factory=ProcessOptions)
@@ -267,11 +254,18 @@ class BatchProcessRequest(BaseModel):
 def extract_text(filename: str, data: bytes) -> tuple[str, list[dict[str, Any]]]:
     ext = Path(filename).suffix.lower()
     if ext == ".txt":
-        return data.decode("utf-8-sig", errors="replace"), []
+        try:
+            return data.decode("utf-8-sig"), []
+        except UnicodeDecodeError as exc:
+            raise HTTPException(400, "The text document must be UTF-8 encoded.") from exc
     if ext == ".csv":
         import csv
         import io
-        rows = csv.reader(io.StringIO(data.decode("utf-8-sig", errors="replace")))
+        try:
+            csv_text = data.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(400, "The CSV document must be UTF-8 encoded.") from exc
+        rows = csv.reader(io.StringIO(csv_text))
         return "\n".join(" | ".join(cell.strip() for cell in row) for row in rows if any(cell.strip() for cell in row)), []
     if ext == ".json":
         try:
@@ -556,7 +550,8 @@ def process_extractively(doc: dict[str, Any], options: ProcessOptions) -> dict[s
             "claims": claims, "quality": {"groundedness": local_groundedness, "claims_checked": len(claims), "evaluation": "Deterministic source-overlap check; translation unavailable, showing the source-language summary."},
             "stats": {"pages": len(doc.get("pages", [])) or None, "words": words, "estimated_tokens": round(words * 1.35), "sections": len(re.findall(r"(?m)^(?:#{1,3} |[A-Z][A-Z 0-9'-]{5,100})$", text)), "chunks": len(chunks), "context_chunks_used": len({s.get("sources", [{}])[0].get("chunk_id") for s in claims if s.get("sources")}), "language": doc["language"], "scanned": bool(doc.get("pages") and not text.strip())},
             "limitations": [_translation_fallback_msg],
-            "provider": {"name": "local fallback", "model": None, "fallback_used": True},
+            "provider": {"name": "deterministic-extractive", "model": None, "fallback_used": True,
+                         "fallback_reason": "translation_unavailable"},
         }
         doc["result"] = result
         doc["options"] = options.model_dump() | {"summary_depth": options.summary_depth, "summary_mode": options.summary_mode or options.summary_depth, "output_language": options.language}
@@ -585,7 +580,8 @@ def process_extractively(doc: dict[str, Any], options: ProcessOptions) -> dict[s
         "claims": claims, "quality": {"groundedness": local_groundedness, "claims_checked": len(claims), "evaluation": "Deterministic source-overlap check; no learned evaluator configured."},
         "stats": {"pages": len(doc.get("pages", [])) or None, "words": words, "estimated_tokens": round(words * 1.35), "sections": len(re.findall(r"(?m)^(?:#{1,3} |[A-Z][A-Z 0-9-]{5,}$)", text)), "chunks": len(chunks), "context_chunks_used": len({s.get("sources", [{}])[0].get("chunk_id") for s in claims if s.get("sources")}), "language": doc["language"], "scanned": bool(doc.get("pages") and not text.strip())},
         "limitations": ["Summary is extractive and uses local heuristics; it does not call an LLM.", "Purpose and audience style instructions require a configured semantic model.", "Risk, decision, and action extraction require a configured semantic model and are left empty rather than guessed."],
-        "provider": {"name": "local fallback", "model": None, "fallback_used": False},
+        "provider": {"name": "deterministic-extractive", "model": None, "fallback_used": True,
+                     "fallback_reason": "no_llm_generation_requested"},
     }
     doc["result"] = result
     doc["options"] = options.model_dump() | {"summary_depth": options.summary_depth, "summary_mode": options.summary_mode or options.summary_depth, "output_language": options.language}
@@ -594,7 +590,7 @@ def process_extractively(doc: dict[str, Any], options: ProcessOptions) -> dict[s
 
 
 def process_document(doc: dict[str, Any], options: ProcessOptions) -> dict[str, Any]:
-    """Use OpenRouter when configured; retain a clearly labeled local fallback."""
+    """Generate through the configured provider chain, then use a deterministic summary."""
     doc["text"] = validate_document_text(doc.get("text", ""))
     if not doc.get("chunks"):
         doc["chunks"] = make_chunks(doc["text"], doc.get("pages", []), document_id=doc.get("id"))
@@ -618,84 +614,81 @@ def process_document(doc: dict[str, Any], options: ProcessOptions) -> dict[str, 
         source_language, requested_output_language, target_language, source_language != target_language,
     )
     LOGGER.info("[ANALYSIS] document_id=%s requested_depth=%s resolved_depth=%s output_language=%s", doc.get("id", "unknown"), requested_depth, resolved_depth, target_language)
-    try:
-        service = OpenRouterService()
-    except RuntimeError as exc:
-        service = None
-        LOGGER.warning("Configured summary provider is unavailable (%s)", type(exc).__name__)
+    LOGGER.info("[SUMMARY] document_id=%s extracted_text_length=%d chunk_count=%d generation_started", doc.get("id", "unknown"), len(doc["text"]), len(doc["chunks"]))
+    service = LLMService()
 
     def summarize(source: dict[str, Any], current_options: ProcessOptions) -> dict[str, Any]:
-        primary_error: Exception | None = None
-        local_error: Exception | None = None
-        if service is not None:
-            try:
-                primary_result = summarize_with_openrouter(source, current_options, service)
-                LOGGER.info("[LLM PROVIDER] selected=%s model=%s", service.provider_name, service.model)
-                return primary_result
-            except Exception as exc:
-                primary_error = exc
-                LOGGER.warning("Configured summary provider=%s failed type=%s; trying Ollama", service.provider_name, type(exc).__name__)
-        else:
-            LOGGER.warning("Configured summary provider is unavailable; trying Ollama")
-
-        local_service = get_local_llm_service()
-        if local_service is not None:
-            try:
-                local_result = summarize_with_openrouter(source, current_options, local_service)
-                local_result["provider"] = {"name": local_service.provider_name, "model": local_service.model, "fallback_used": True}
-                local_result["provider_status"] = {
-                    "primary": (f"FAILED ({type(primary_error).__name__})" if primary_error else "UNAVAILABLE"),
-                    "ollama": "AVAILABLE - generated summary; source checked locally",
-                    "final": "OLLAMA SUMMARY",
-                }
-                local_result["limitations"] = ["External summary provider was unavailable; an already-installed local LLM generated this result.", *local_result.get("limitations", [])]
-                LOGGER.info("[LLM PROVIDER] selected=ollama-local model=%s reason=external_unavailable_or_failed", local_service.model)
-                return local_result
-            except Exception as exc:
-                local_error = exc
-                # Include the validation reason (never prompt/source text) so a
-                # structured-output rejection isn't mistaken for a network timeout.
-                LOGGER.warning(
-                    "Ollama summary failed model=%s timeout=%ss type=%s reason=%s; using deterministic extractive summary",
-                    local_service.model,
-                    local_service.timeout,
-                    type(exc).__name__,
-                    str(exc)[:240],
-                )
-
-        if service is not None:
-            secondary_service = _get_fallback_llm_service(service)
-            if secondary_service is not None:
-                try:
-                    secondary_result = summarize_with_openrouter(source, current_options, secondary_service)
-                    secondary_result["provider"] = {"name": secondary_service.provider_name, "model": secondary_service.model, "fallback_used": True}
-                    secondary_result["limitations"] = [f"Primary provider {service.provider_name} failed; configured secondary provider {secondary_service.provider_name} generated this result.", *secondary_result.get("limitations", [])]
-                    LOGGER.info("[SUMMARY FALLBACK] selected=%s model=%s", secondary_service.provider_name, secondary_service.model)
-                    return secondary_result
-                except Exception as exc:
-                    LOGGER.warning("Configured secondary LLM failed; using deterministic extractive summary (%s)", type(exc).__name__)
-
-        fallback = process_extractively(source, current_options)
-        target_name = LANGUAGES.get(current_options.language, current_options.language)
-        limitations = [
-            "External providers were unavailable; deterministic sentence ranking produced this source-grounded extractive summary.",
-            "The local extractive fallback does not infer risks, decisions, or actions and does not translate text.",
-        ]
-        if current_options.language != source["language"]:
-            limitations.insert(0, f"Translation into {target_name} was unavailable; the usable source-language summary is shown.")
-        elif primary_error is not None:
-            limitations.insert(0, f"The configured summary provider failed ({type(primary_error).__name__}); a local extractive fallback was used.")
-        fallback["limitations"] = limitations
-        fallback["provider"] = {"name": "local extractive fallback", "model": None, "fallback_used": True}
-        fallback["provider_status"] = {
-            "primary": (f"FAILED ({type(primary_error).__name__})" if primary_error else "UNAVAILABLE"),
-            "ollama": (f"AVAILABLE - generation failed ({type(local_error).__name__})" if local_error else "UNAVAILABLE - model or API check failed"),
-            "final": "DETERMINISTIC EXTRACTIVE SUMMARY",
-        }
-        LOGGER.info("[SUMMARY FALLBACK] selected=extractive source=%s final=%s", source["language"], fallback.get("language"))
-        return fallback
+        try:
+            summary = summarize_document(source, current_options, service)
+            text = summary_text(summary.get("executive_summary")) or summary_text(summary.get("summary"))
+            if not is_usable_summary(text):
+                raise LLMGenerationError("Configured providers returned no usable summary.")
+            summary["executive_summary"] = text
+            summary["provider"] = service.provider_metadata
+            summary["generation_status"] = "success"
+            return summary
+        except Exception as exc:
+            metadata = service.provider_metadata
+            LOGGER.warning("[SUMMARY] generation_failed type=%s; using extractive summary", type(exc).__name__)
+            fallback = process_extractively(source, current_options)
+            target_name = LANGUAGES.get(current_options.language, current_options.language)
+            limitations = ["Configured providers could not generate a usable summary; deterministic sentence ranking produced this source-grounded extractive summary.",
+                           "The local extractive fallback does not infer risks, decisions, or actions and does not translate text."]
+            if current_options.language != source["language"]:
+                limitations.insert(0, f"Translation into {target_name} was unavailable; the usable source-language summary is shown.")
+            fallback["limitations"] = limitations
+            fallback["provider"] = {
+                "name": "deterministic-extractive", "model": None, "fallback_used": True,
+                "fallback_reason": metadata.get("fallback_reason", type(exc).__name__),
+                "providers_attempted": ["openai-gateway", "gemini", "ollama-local"],
+            }
+            fallback["generation_status"] = "partial_success" if is_usable_summary(fallback.get("executive_summary")) else "failed"
+            fallback["provider_status"] = {"primary": "Gemini failed or returned unusable output", "fallback": "Ollama Local failed or was unavailable", "final": "deterministic extractive summary"}
+            return fallback
 
     result = run_analysis_workflow(doc, resolved_options, summarize)
+    # A valid JSON response can still omit the requested summary fields. Treat
+    # that as a generation failure and use the same source-backed fallback as
+    # provider exceptions instead of persisting a blank successful result.
+    generated_summary = summary_text(result.get("executive_summary")) or summary_text(result.get("summary"))
+    if not is_usable_summary(generated_summary):
+        LOGGER.warning("[SUMMARY] document_id=%s generated_text_length=%d unusable_response; fallback_started", doc.get("id", "unknown"), len(generated_summary))
+        fallback = process_extractively(doc, resolved_options)
+        fallback_summary = summary_text(fallback.get("executive_summary"))
+        if is_usable_summary(fallback_summary):
+            primary_info = result.get("provider") if isinstance(result.get("provider"), dict) else {}
+            primary_name = primary_info.get("name") or service.provider_name
+            primary_model = primary_info.get("model") or (service.model if service is not None else None)
+            result = fallback
+            result["limitations"] = [
+                "The configured summary provider returned no usable summary; a deterministic extractive fallback was used.",
+                *result.get("limitations", []),
+            ]
+            result["provider"] = {"name": "deterministic-extractive", "model": None, "fallback_used": True,
+                                   "fallback_reason": "all_configured_providers_failed",
+                                   "providers_attempted": ["openai-gateway", "gemini", "ollama-local"],
+                                   "primary_provider": primary_name, "primary_model": primary_model}
+            result["provider_status"] = {"primary": f"{primary_name} RETURNED NO USABLE SUMMARY", "final": "DETERMINISTIC EXTRACTIVE SUMMARY"}
+            result["generation_status"] = "partial_success"
+            result["warning"] = "The AI provider returned no usable summary; a source-grounded extractive summary was used."
+            LOGGER.info("[SUMMARY] document_id=%s fallback_completed text_length=%d provider=deterministic_extractive_fallback", doc.get("id", "unknown"), len(fallback_summary))
+        else:
+            result["status"] = "failed"
+            result["generation_status"] = "failed"
+            result["executive_summary"] = None
+            result["summary"] = None
+            result["error"] = "No usable summary could be generated from the extracted document text."
+            result["provider"] = {"name": "none", "model": None, "fallback_used": True}
+            LOGGER.error("[SUMMARY] document_id=%s fallback_completed text_length=0 generation_failed", doc.get("id", "unknown"))
+    else:
+        result["executive_summary"] = generated_summary
+        provider_info = result.get("provider") if isinstance(result.get("provider"), dict) else {}
+        fallback_used = bool(provider_info.get("fallback_used")) or provider_info.get("name") == "deterministic-extractive"
+        result["provider"] = provider_info | {"fallback_used": fallback_used}
+        result["generation_status"] = "partial_success" if fallback_used or result.get("validation_warning") or result.get("translation_failed_fallback") else "success"
+    if result.get("generation_status") != "failed":
+        result["summary"] = result.get("executive_summary")
+    LOGGER.info("[SUMMARY] document_id=%s final_summary_length=%d generation_status=%s provider=%s model=%s", doc.get("id", "unknown"), len(result.get("executive_summary") or ""), result.get("generation_status"), (result.get("provider") or {}).get("name"), (result.get("provider") or {}).get("model"))
     if doc.get("ocr_detected"):
         result.setdefault("limitations", []).append("OCR text was included in the source. Check low-confidence image text against the original page.")
     result.setdefault("limitations", []).extend(w for w in doc.get("ocr_warnings", []) if w not in result.get("limitations", []))
@@ -706,14 +699,37 @@ def process_document(doc: dict[str, Any], options: ProcessOptions) -> dict[str, 
     )
     LOGGER.info(
         "[ANALYSIS RESULT] source=%s target=%s summary_generated=%s translation_status=%s validation_status=%s regeneration_count=%s final_output=%s",
-        source_language, target_language, bool(result.get("executive_summary")),
+        source_language, target_language, is_usable_summary(result.get("executive_summary")),
         result.get("translation_validation_status"), result.get("validation_status"),
         result.get("stats", {}).get("regeneration_count", 0), result.get("language"),
     )
+    evaluation_summary = result.get("_evaluation_input_summary")
+    evaluation_claims = result.get("_evaluation_input_claims")
+    if not evaluation_summary:
+        evaluation_summary = result.get("executive_summary")
+        evaluation_claims = result.get("claims", [])
+    try:
+        result["evaluation"] = evaluate_summary(
+            doc.get("text", ""), evaluation_summary,
+            claims=evaluation_claims or [], chunks=doc.get("chunks", []),
+            source_language=source_language,
+            summary_language=source_language if result.get("_evaluation_input_summary") else result.get("language", source_language),
+            purpose=options.purpose, depth=resolved_depth, provider=result.get("provider"),
+        )
+    except Exception as exc:
+        # A scoring implementation error must never be replaced with invented
+        # values. Preserve the analysis response and mark every score unavailable.
+        LOGGER.exception("Summary evaluation failed type=%s", type(exc).__name__)
+        result["evaluation"] = evaluate_summary(doc.get("text", ""), None)
+        result["evaluation"]["evaluation_status"] = "failed"
+        result["evaluation"]["reason"] = "Evaluation could not be completed; no scores were produced."
+    result.pop("_evaluation_input_summary", None)
+    result.pop("_evaluation_input_claims", None)
     doc["result"] = result
     doc["options"] = options.model_dump() | {"summary_depth": resolved_depth, "summary_mode": requested_depth, "custom_sections": options.custom_sections, "custom_detail": options.custom_detail, "source_language": source_language, "requested_output_language": requested_output_language, "output_language": result.get("language"), "resolved_output_language": result.get("language")}
-    doc["status"] = "COMPLETED"
+    doc["status"] = "FAILED" if result.get("generation_status") == "failed" else "COMPLETED"
     save_doc(doc)
+    LOGGER.info("[SUMMARY] document_id=%s persistence=success user_id=%s", doc.get("id", "unknown"), doc.get("user_id", "unknown"))
     if doc.get("user_id") is not None:
         provider = result.get("provider") if isinstance(result.get("provider"), dict) else {}
         record_history(user_id=int(doc["user_id"]), document_id=str(doc["id"]),
@@ -747,61 +763,36 @@ def process_document(doc: dict[str, Any], options: ProcessOptions) -> dict[str, 
 @app.get("/api/health")
 def health():
     database_status = database_schema_status()
-    requested_llm_provider = os.getenv("LLM_PROVIDER", "sarvam").strip().lower() or "sarvam"
-    sarvam_key = os.getenv("SARVAM_API_KEY", "").strip()
-    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    groq_key = os.getenv("GROQ_API_KEY", "").strip()
-    if requested_llm_provider == "sarvam":
-        active_llm_provider = "sarvam" if sarvam_key else ("openrouter" if openrouter_key else ("groq" if groq_key else "local-demo"))
-    elif requested_llm_provider == "groq":
-        active_llm_provider = "groq" if groq_key else ("openrouter" if openrouter_key else "local-demo")
-    else:
-        active_llm_provider = "openrouter" if openrouter_key else ("groq" if groq_key else "local-demo")
-    local_llm_service = get_local_llm_service() if active_llm_provider == "local-demo" else None
-    if local_llm_service is not None:
-        active_llm_provider = "ollama-local"
-    gateway_configured = get_openai_gateway().configured
-    if gateway_configured:
-        active_llm_provider = "openai-gateway"
-        local_llm_service = None
-    llm_configured = active_llm_provider != "local-demo"
+    local_llm = get_local_llm_service()
     embedding_svc = get_embedding_service()
     emb_info = embedding_svc.get_info()
-    embedding_provider = os.getenv("EMBEDDING_PROVIDER", "groq").strip()
-    vector_db_url = os.getenv("VECTOR_DB_URL", "").strip()
-    openai_configured = bool(os.getenv("OPENAI_API_KEY", "").strip())
     return {
         "status": "ok" if database_status["schema_ready"] else "degraded",
-        "mode": active_llm_provider,
-        "requested_llm_provider": "openai-gateway" if gateway_configured else requested_llm_provider,
-        "llm": "configured" if llm_configured else "not-configured",
-        "model": (
-            "gateway-managed" if active_llm_provider == "openai-gateway" else
-            os.getenv("SARVAM_MODEL", "sarvam-105b") if active_llm_provider == "sarvam" else
-            os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile") if active_llm_provider == "groq" else
-            os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini") if active_llm_provider == "openrouter" else
-            local_llm_service.model if local_llm_service is not None else None
-        ),
-        "ocr": ocr_status(),
-        "embeddings": "configured",
-        "embedding_provider": "openai-gateway" if emb_info.get("gateway_configured") else embedding_provider,
-        "embedding_details": emb_info,
-        "vector_database": "configured" if vector_db_url else "mysql-document-chunk-vectors",
-        "retrieval": "hybrid-semantic",
-        "database": "connected" if database_status["connected"] else "unavailable",
-        "database_name": database_status["database"],
-        "database_schema": "ready" if database_status["schema_ready"] else "missing",
-        "missing_tables": database_status["missing_tables"],
-        "missing_columns": database_status["missing_columns"],
-        "tts": {"default": os.getenv("TTS_PROVIDER", "browser").strip().lower(), "available": ["browser", "edge-neural"]},
-        "stt": {
-            "provider": "openai-whisper-with-local-fallback" if openai_configured else "faster-whisper-local",
-            "fallback": "faster-whisper-local",
-            "status": "cloud-primary-local-fallback" if openai_configured else "local-offline",
-            "languages": list(LANGUAGES.keys()),
+        "mode": "openai-gateway" if (os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENAI_GATEWAY_API_KEY", "")).strip() else ("gemini" if os.getenv("GEMINI_API_KEY", "").strip() else ("ollama-local" if local_llm else "unavailable")),
+        "llm": {
+            "primary_provider": "openai-gateway",
+            "primary_url": os.getenv("OPENAI_GATEWAY_URL", "https://keygateway1.arshnivlabs.com/v1").strip(),
+            "primary_model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            "primary_configured": bool((os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENAI_GATEWAY_API_KEY", "")).strip()),
+            "secondary_provider": "gemini",
+            "secondary_model": os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+            "secondary_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
+            "fallback_provider": "ollama-local",
+            "fallback_model": local_llm.model if local_llm else os.getenv("OLLAMA_MODEL", "llama3.2"),
+            "fallback_available": local_llm is not None,
+            "priority": ["openai-gateway", "gemini", "ollama-local"],
         },
+        "database": database_status,
+        "embedding": emb_info,
+        "embeddings": {
+            "provider": os.getenv("EMBEDDING_PROVIDER", "groq").strip(),
+            "model": emb_info.get("model"),
+            "configured": emb_info.get("configured", False),
+        },
+        "vector_db": {"configured": bool(os.getenv("VECTOR_DB_URL", "").strip()), "connected": False},
+        "speech": {"provider": os.getenv("TTS_PROVIDER", "edge").strip().lower(), "configured": True},
+        "ocr": ocr_status(),
     }
-
 
 @app.post("/api/voice/transcribe")
 async def voice_transcribe(
@@ -898,36 +889,9 @@ def create_demo(current_user: dict[str, Any] = Depends(get_current_user)):
     doc_id = str(uuid.uuid4())
     pages = []
     doc = {"id": doc_id, "user_id": int(current_user["id"]), "name": "Northstar Annual Review · Demo.txt", "text": normalize(text), "pages": pages, "chunks": make_chunks(text, pages, document_id=doc_id), "language": "en", "status": "UPLOADED", "created_at": datetime.now(timezone.utc).isoformat(), "result": None}
-    save_doc(doc)
-    result = process_extractively(doc, ProcessOptions(summary_depth="standard", purpose="Executive briefing", language="en", audience="Leadership"))
+    LOGGER.info("[DEMO] created document_id=%s user_id=%s extracted_text_length=%d chunk_count=%d", doc_id, current_user["id"], len(doc["text"]), len(doc["chunks"]))
+    result = process_document(doc, ProcessOptions(summary_depth="standard", purpose="Executive briefing", language="en", audience="Leadership"))
     return public_doc(doc) | {"result": result}
-
-
-@app.get("/api/dataset/govreport")
-def govreport_dataset(split: str = "train", limit: int | None = None, evaluation_mode: bool = False, current_user: dict[str, Any] = Depends(get_current_user)):
-    if split not in GOVREPORT_SPLITS:
-        raise HTTPException(422, "split must be train, validation, or test")
-    try:
-        records = stream_govreport_records(split=split, limit=limit, evaluation=evaluation_mode)
-    except (ValueError, RuntimeError) as exc:
-        raise HTTPException(503, str(exc)) from exc
-    return {"dataset": "ccdv/govreport-summarization", "split": split, "count": len(records), "records": [{"id": r["id"], "id_source": r.get("id_source", "dataset"), "report_characters": len(r["report"]), "summary_characters": len(r["summary"]), "preview": r["report"][:280]} for r in records]}
-
-
-@app.post("/api/dataset/govreport/{record_id}/load")
-def load_govreport_document(record_id: str, split: str = "train", limit: int | None = None, evaluation_mode: bool = False, current_user: dict[str, Any] = Depends(get_current_user)):
-    if split not in GOVREPORT_SPLITS:
-        raise HTTPException(422, "split must be train, validation, or test")
-    try:
-        record = get_govreport_record(record_id, split=split, limit=limit, evaluation=evaluation_mode)
-    except (ValueError, RuntimeError) as exc:
-        raise HTTPException(503, str(exc)) from exc
-    if not record:
-        raise HTTPException(404, "GovReport record not found in the configured bounded subset.")
-    doc = govreport_to_document(record, split)
-    doc["user_id"] = int(current_user["id"])
-    save_doc(doc)
-    return public_doc(doc) | {"dataset": doc["dataset"]}
 
 
 async def _upload_file(file: UploadFile, ocr_language: str, current_user: dict[str, Any], batch_id: str | None = None):
@@ -1009,7 +973,7 @@ async def upload(file: UploadFile = File(...), ocr_language: str = Form(default=
 
 @app.post("/api/documents/upload-batch")
 async def upload_batch(files: list[UploadFile] = File(...), ocr_language: str = Form(default="auto"), current_user: dict[str, Any] = Depends(get_current_user)):
-    limit = config_int("MAX_DOCUMENTS_PER_BATCH", 8)
+    limit = config_int("MAX_DOCUMENTS_PER_BATCH", 10)
     total_limit = config_int("MAX_TOTAL_UPLOAD_MB", 80) * 1024 * 1024
     if not files or len(files) > limit:
         raise HTTPException(413, "The document batch exceeds the configured document limit.")
@@ -1088,12 +1052,12 @@ def list_documents(search: str = "", current_user: dict[str, Any] = Depends(get_
     return [public_doc(d) for d in documents]
 
 
-@app.post("/api/local-llm/test")
+@app.post("/api/llm/test")
+@app.post("/api/local-llm/test", include_in_schema=False)
 def local_llm_test(payload: LocalLLMTestRequest, current_user: dict[str, Any] = Depends(get_current_user)):
-    """Run a prompt through the configured, already-installed local Ollama model."""
-    service = get_local_llm_service()
-    if service is None:
-        raise HTTPException(503, "LLM stage failed: Ollama or the configured local model is unavailable.")
+    """Run a real prompt through the same authenticated centralized provider chain."""
+    LOGGER.info("[LLM TEST] request_started user_id=%s", current_user.get("id", "authenticated"))
+    service = LLMService()
     try:
         response_text = service.complete(
             "Answer the user's prompt clearly and concisely. If asked to summarize, summarize only the supplied text and do not invent facts.",
@@ -1101,9 +1065,122 @@ def local_llm_test(payload: LocalLLMTestRequest, current_user: dict[str, Any] = 
             max_tokens=800,
         )
     except Exception as exc:
-        LOGGER.warning("Local LLM test failed model=%s type=%s", service.model, type(exc).__name__)
-        raise HTTPException(502, f"LLM stage failed: local Ollama request failed ({type(exc).__name__}).") from exc
-    return {"response": response_text, "provider": service.provider_name, "model": service.model}
+        LOGGER.warning("[LLM TEST] request_failed error_type=%s", type(exc).__name__)
+        return JSONResponse(status_code=502, content={
+            "success": False,
+            "error": "All configured AI providers are currently unavailable.",
+            "provider_trace": service.provider_trace,
+        })
+    metadata = service.provider_metadata
+    return {
+        "success": True,
+        "response": response_text,
+        "provider": metadata.get("name"),
+        "model": metadata.get("model"),
+        "fallback_used": bool(metadata.get("fallback_used")),
+        "fallback_reason": metadata.get("fallback_reason"),
+        "provider_metadata": metadata,
+        "provider_trace": service.provider_trace,
+    }
+
+
+@app.post("/api/llm/diagnostics")
+def llm_provider_diagnostics(current_user: dict[str, Any] = Depends(get_current_user)):
+    """Explicitly probe each configured provider separately; startup generates no test traffic."""
+    probe_system = "Return exactly the requested diagnostic token and nothing else."
+    results: list[dict[str, Any]] = []
+    for provider in (OpenAIGatewayProvider(), GeminiProvider()):
+        name = provider.provider_name
+        is_gemini = name == "gemini"
+        entry = {"provider": name, "model": provider.model,
+                 "endpoint": "https://generativelanguage.googleapis.com" if is_gemini else provider.base_url,
+                 "api_key_present": bool(provider.api_key), "request_started": False,
+                 "configured": bool(provider.client), "available": False,
+                 "request_success": False, "response_non_empty": False}
+        if provider.client:
+            try:
+                entry["request_started"] = True
+                response_text = provider.complete(probe_system, "Return the word OK", max_tokens=12)
+                entry["response_non_empty"] = bool(response_text and response_text.strip())
+                entry["request_success"] = entry["response_non_empty"]
+                entry["available"] = entry["request_success"]
+            except Exception as exc:
+                entry["error_type"] = _diagnostic_error_type(exc)
+                entry["http_status"] = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+                entry["error_message"] = _safe_diagnostic_message(exc)
+        elif getattr(provider, "client_error", None):
+            entry["error_type"] = "SDKCompatibilityError"
+            entry["error_message"] = "Provider SDK could not be initialized."
+        else:
+            entry["error_type"] = "MissingAPIKey"
+            entry["error_message"] = f"{('GEMINI_API_KEY' if is_gemini else 'OPENAI_API_KEY')} is missing or empty; no request was sent."
+        results.append(entry)
+    local = get_local_llm_service()
+    probe_prompt = "OK"
+    entry = {"provider": "ollama-local", "model": os.getenv("OLLAMA_MODEL", "llama3.2:1b"),
+             "endpoint": os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
+             "configured": local is not None, "available": False}
+    if local is not None:
+        entry["model"] = local.model
+        try:
+            entry["response"] = local.complete(probe_system, probe_prompt, max_tokens=4)
+            entry["response_non_empty"] = bool(entry["response"] and entry["response"].strip())
+            entry["request_success"] = entry["response_non_empty"]
+            entry["available"] = entry["request_success"]
+        except Exception as exc:
+            entry["error_type"] = type(exc).__name__
+            entry["error_message"] = _safe_diagnostic_message(exc)
+    else:
+        entry["error_type"] = "ConfigurationError"
+        entry["error_message"] = "Ollama endpoint is unavailable or the configured model is not installed."
+    results.append(entry)
+    return {"priority": ["openai-gateway", "gemini", "ollama-local"], "providers": results}
+
+
+def _safe_diagnostic_message(exc: Exception) -> str:
+    status = str(getattr(exc, "status_code", None) or getattr(exc, "code", None) or "")
+    if "timeout" in type(exc).__name__.lower():
+        return "Provider request timed out."
+    if status == "401":
+        return "Authentication failed. Check the configured API credential."
+    if status == "403":
+        return "Provider rejected the request because of permissions."
+    if status == "429":
+        return "Provider quota or rate limit was exceeded."
+    if status == "404":
+        return "Configured model or endpoint was not found."
+    if status == "503":
+        return "Provider is temporarily unavailable or overloaded."
+    if status.startswith("5"):
+        return "Provider service returned a server error."
+    if status == "400":
+        return "Provider rejected the request; check model and payload compatibility."
+    if isinstance(exc, ValueError):
+        return "Provider response was empty or invalid."
+    return f"Provider request failed ({type(exc).__name__})."
+
+
+def _diagnostic_error_type(exc: Exception) -> str:
+    if getattr(exc, "category", None):
+        return str(exc.category)
+    status = str(getattr(exc, "status_code", None) or getattr(exc, "code", None) or "")
+    if status == "401":
+        return "AuthenticationError"
+    if status == "403":
+        return "PermissionError"
+    if status == "404":
+        return "ModelNotFound"
+    if status == "429":
+        return "RateLimitOrQuotaExceeded"
+    if status == "503":
+        return "ServiceUnavailable"
+    if status == "400":
+        return "InvalidRequest"
+    if "timeout" in type(exc).__name__.lower():
+        return "TimeoutError"
+    if "connect" in type(exc).__name__.lower():
+        return "NetworkError"
+    return type(exc).__name__
 
 
 @app.post("/api/speech/transcribe")
@@ -1239,15 +1316,12 @@ def process(doc_id: str, options: ProcessOptions, current_user: dict[str, Any] =
     except Exception:
         record_processing_failure(doc, int(current_user["id"]))
         raise
-    if doc.get("reference_summary"):
-        doc["evaluation"] = evaluate_record(result, doc["reference_summary"])
-        result["evaluation"] = doc["evaluation"]
     return result
 
 
 @app.post("/api/documents/process-batch")
 def process_batch(payload: BatchProcessRequest, current_user: dict[str, Any] = Depends(get_current_user)):
-    limit = config_int("MAX_DOCUMENTS_PER_BATCH", 8)
+    limit = config_int("MAX_DOCUMENTS_PER_BATCH", 10)
     if len(payload.document_ids) > limit or len(set(payload.document_ids)) != len(payload.document_ids):
         raise HTTPException(422, "The document batch is invalid or exceeds the configured limit.")
     # Validate ownership before starting any work so a mixed/foreign batch is
@@ -1449,39 +1523,22 @@ def ask(doc_id: str, payload: AskRequest, current_user: dict[str, Any] = Depends
         return response
 
     source_list = [{"document_id": doc["id"], "chunk_id": c["id"], "page": c.get("page") or "unavailable", "section": c.get("section", "Document text"), "text": c["text"][:600]} for c in evidence]
-    answer = None
-    answer_provider = None
+    service = LLMService()
     try:
-        service = OpenRouterService()
-    except Exception as exc:
-        service = None
-        LOGGER.info("[LLM PROVIDER] hosted provider unavailable for Q&A type=%s; trying local Ollama", type(exc).__name__)
-    if service is not None:
-        try:
-            answer = answer_with_openrouter(payload.question, evidence, service, output_language=output_lang)
-            answer_provider = service.provider_name
-            LOGGER.info("[LLM PROVIDER] selected=%s model=%s operation=question_answering", service.provider_name, service.model)
-        except Exception as exc:
-            LOGGER.warning("Hosted LLM Q&A failed provider=%s type=%s; trying local Ollama", service.provider_name, type(exc).__name__)
-    if answer is None:
-        local_service = get_local_llm_service()
-        if local_service is not None:
-            try:
-                answer = answer_with_openrouter(payload.question, evidence, local_service, output_language=output_lang)
-                answer_provider = local_service.provider_name
-                LOGGER.info("[LLM PROVIDER] selected=%s model=%s operation=question_answering", answer_provider, local_service.model)
-            except Exception as exc:
-                LOGGER.warning("Local Ollama Q&A failed model=%s type=%s; returning source excerpts", local_service.model, type(exc).__name__)
-    if answer is not None:
-        mode_desc = "Answer grounded in hybrid semantic/lexical evidence" if semantic_used else "Answer grounded in lexical evidence"
-        response = {"answer": answer, "sources": source_list, "grounded": True, "output_language": output_lang, "retrieval_provider": emb_svc.last_status.get("effective_provider", "lexical"), "llm_provider": answer_provider, "mode": mode_desc}
-        save_question(doc_id, payload.question, response, output_lang)
-        return response
-    LOGGER.warning("No LLM provider produced a Q&A response; returning source excerpts")
-    response = {"answer": "\n\n".join(c["text"][:600] for c in evidence), "sources": source_list, "grounded": True, "output_language": doc.get("language", "und"), "requested_language": output_lang, "retrieval_provider": emb_svc.last_status.get("effective_provider", "lexical"), "mode": "source-language retrieval fallback; no generated answer"}
+        answer = answer_from_evidence(payload.question, evidence, service, output_language=output_lang)
+    except LLMGenerationError as exc:
+        LOGGER.warning("Grounded Q&A generation unavailable type=%s", type(exc).__name__)
+        raise HTTPException(503, "Configured providers could not generate a grounded answer.") from exc
+    mode_desc = "Answer grounded in hybrid semantic/lexical evidence" if semantic_used else "Answer grounded in lexical evidence"
+    provider = service.provider_metadata
+    response = {
+        "answer": answer, "sources": source_list, "grounded": True,
+        "output_language": output_lang, "retrieval_provider": emb_svc.last_status.get("effective_provider", "lexical"),
+        "llm_provider": provider.get("name"), "llm_model": provider.get("model"),
+        "fallback_used": provider.get("fallback_used", False), "mode": mode_desc,
+    }
     save_question(doc_id, payload.question, response, output_lang)
     return response
-
 
 class TranslateRequest(BaseModel):
     language: str = Field(default="auto", validation_alias=AliasChoices("output_language", "language"))
@@ -1531,9 +1588,6 @@ def translate_summary(doc_id: str, payload: TranslateRequest, current_user: dict
     except Exception:
         record_processing_failure(doc, int(current_user["id"]))
         raise
-    if doc.get("reference_summary"):
-        doc["evaluation"] = evaluate_record(result, doc["reference_summary"])
-        result["evaluation"] = doc["evaluation"]
     return result
 
 
@@ -1590,28 +1644,13 @@ def audio(doc_id: str, payload: AudioRequest, current_user: dict[str, Any] = Dep
     # Preserve user's requested language throughout
     narration_text = result["executive_summary"]
     if payload.language != result.get("language"):
-        translated_text = None
+        translation_service = LLMService()
         try:
-            hosted_service = OpenRouterService()
-        except RuntimeError as exc:
-            hosted_service = None
-            LOGGER.info("Hosted LLM unavailable for audio translation type=%s; trying local Ollama", type(exc).__name__)
-        if hosted_service is not None:
-            try:
-                translated_text = translate_for_audio(narration_text, payload.language, hosted_service)
-                LOGGER.info("[LLM PROVIDER] selected=%s model=%s operation=audio_translation", hosted_service.provider_name, hosted_service.model)
-            except Exception as exc:
-                LOGGER.warning("Hosted audio translation failed provider=%s type=%s; trying local Ollama", hosted_service.provider_name, type(exc).__name__)
-        if translated_text is None:
-            local_service = get_local_llm_service()
-            if local_service is not None:
-                try:
-                    translated_text = translate_for_audio(narration_text, payload.language, local_service)
-                    LOGGER.info("[LLM PROVIDER] selected=%s model=%s operation=audio_translation", local_service.provider_name, local_service.model)
-                except Exception as exc:
-                    LOGGER.warning("Local audio translation failed model=%s type=%s", local_service.model, type(exc).__name__)
-        if translated_text is None:
-            raise HTTPException(503, "Audio translation is unavailable: configure a local Ollama model or a hosted LLM provider.")
+            translated_text = translate_for_audio(narration_text, payload.language, translation_service)
+            LOGGER.info("[LLM PROVIDER] selected=%s model=%s operation=audio_translation", translation_service.provider_name, translation_service.model)
+        except (LLMGenerationError, ValueError) as exc:
+            LOGGER.warning("Audio translation unavailable type=%s", type(exc).__name__)
+            raise HTTPException(503, "Audio translation is unavailable from the configured providers.") from exc
         narration_text = translated_text
 
     # Determine requested provider
@@ -1781,11 +1820,7 @@ async def compare(
     lang_a = detect_language(ta)
     lang_b = detect_language(tb)
 
-    llm_service = None
-    try:
-        llm_service = OpenRouterService()
-    except Exception:
-        llm_service = _get_fallback_llm_service()
+    llm_service = LLMService()
 
     result = perform_document_comparison(
         doc_a_info=info_a,
@@ -1817,38 +1852,15 @@ async def compare(
 
 
 @app.get("/api/evaluation/{doc_id}")
+@app.get("/api/documents/{doc_id}/evaluation")
 def evaluation(doc_id: str, current_user: dict[str, Any] = Depends(get_current_user)):
     doc = get_doc(doc_id, current_user)
     result = doc.get("result")
+    if result and isinstance(result.get("evaluation"), dict):
+        return result["evaluation"]
+    stored = get_latest_summary_evaluation(doc_id, int(current_user["id"]))
+    if stored:
+        return stored
     if not result:
         raise HTTPException(409, "Process the document before requesting evaluation.")
-    if doc.get("reference_summary"):
-        return doc.get("evaluation") or evaluate_record(result, doc["reference_summary"])
-    return {"metrics": {"groundedness": {"value": result["quality"].get("groundedness"), "available": True}}, "metrics_unavailable": ["ROUGE", "semantic similarity", "reference completeness"]}
-
-
-@app.post("/api/evaluation/run")
-def run_evaluation(payload: EvaluationRunRequest, current_user: dict[str, Any] = Depends(get_current_user)):
-    doc = get_doc(payload.document_id, current_user)
-    if not doc.get("reference_summary"):
-        raise HTTPException(422, "This document has no GovReport reference summary for evaluation.")
-    if not doc.get("result"):
-        raise HTTPException(409, "Process the document before running evaluation.")
-    doc["evaluation"] = evaluate_record(doc["result"], doc["reference_summary"])
-    return doc["evaluation"]
-
-
-@app.post("/api/evaluation/{doc_id}/compare-depths")
-def compare_summary_depths(doc_id: str, payload: DepthComparisonRequest, current_user: dict[str, Any] = Depends(get_current_user)):
-    doc = get_doc(doc_id, current_user)
-    if not doc.get("reference_summary"):
-        raise HTTPException(422, "Depth comparison requires a loaded GovReport record.")
-    rows = []
-    for depth in ("quick", "standard", "deep"):
-        options = ProcessOptions(summary_depth=depth, purpose=payload.purpose, audience=payload.audience, language=payload.language)
-        start = time.perf_counter()
-        result = process_document(doc, options)
-        elapsed_ms = round((time.perf_counter() - start) * 1000, 1)
-        rows.append({"depth": depth, "processing_time_ms": elapsed_ms, **evaluate_record(result, doc["reference_summary"])})
-    doc["depth_comparison"] = rows
-    return {"document_id": doc_id, "reference_role": "evaluation_only", "comparisons": rows}
+    raise HTTPException(409, "Evaluation is not available for this summary.")

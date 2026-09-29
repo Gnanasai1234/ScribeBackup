@@ -5,14 +5,15 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import String, cast, func, inspect, or_, select, text
+from sqlalchemy import func, inspect, or_, select, text
 from sqlalchemy.orm import selectinload
 
 from .connection import Base, SessionLocal, engine
 from .models import (AudioRecord, DocumentChunkRecord, DocumentPageRecord, DocumentRecord,
                      CombinedSummaryRecord, HistoryRecord, QuestionAnswerRecord, SummaryClaimRecord,
                      SummaryRecord, TranslationRecord, UploadBatchRecord, ValidationResultRecord,
-                     UserRecord)
+                     SummaryEvaluationRecord, UserRecord)
+from services.guardrails import is_usable_summary, summary_text
 
 
 def _jsonable(value: Any) -> Any:
@@ -28,7 +29,10 @@ def save_document(doc: dict[str, Any]) -> None:
     pages = doc.get("pages", []) or []
     chunks = doc.get("chunks", []) or []
     audio = doc.get("audio_timings") or {}
-    result = doc.get("result")
+    result = doc.get("result") if isinstance(doc.get("result"), dict) else None
+    result_summary = summary_text(result.get("executive_summary")) or summary_text(result.get("summary")) if result else ""
+    persist_summary = is_usable_summary(result_summary)
+    persisted_result = (result | {"executive_summary": result_summary, "summary": result_summary}) if result and persist_summary else None
     with SessionLocal.begin() as session:
         row = session.get(DocumentRecord, doc_id)
         owner_id = int(doc["user_id"]) if doc.get("user_id") is not None else None
@@ -63,16 +67,10 @@ def save_document(doc: dict[str, Any]) -> None:
         row.ocr_warnings = _jsonable(doc.get("ocr_warnings", []))
         row.ocr_detected = bool(doc.get("ocr_detected"))
         row.options = _jsonable(doc.get("options")) if doc.get("options") is not None else None
-        row.evaluation = _jsonable(doc.get("evaluation")) if doc.get("evaluation") is not None else None
-        row.reference_summary = doc.get("reference_summary")
-        row.dataset = _jsonable(doc.get("dataset")) if doc.get("dataset") is not None else None
-        row.depth_comparison = _jsonable(doc.get("depth_comparison")) if doc.get("depth_comparison") is not None else None
         row.audio_timings = _jsonable(audio) if audio else None
         row.pages.clear()
         row.chunks.clear()
-        row.summaries.clear()
-        row.validations.clear()
-        row.translations.clear()
+        # Preserve summary/validation/translation records as version history.
         row.audio_files.clear()
         # Flush orphan deletes before inserting replacement child rows. This
         # keeps the upsert safe when an uploaded PDF is processed and saved again
@@ -88,25 +86,43 @@ def save_document(doc: dict[str, Any]) -> None:
                 language=chunk.get("language"), source=chunk.get("source"),
                 contains_ocr=bool(chunk.get("contains_ocr")), ocr_confidence=chunk.get("ocr_confidence"),
                 embedding=_jsonable(chunk.get("embedding")) if chunk.get("embedding") else None))
-        if result:
-            summary = SummaryRecord(summary_text=result.get("executive_summary", ""), language=result.get("language", doc.get("language", "und")),
+        if result and persist_summary and persisted_result:
+            summary = SummaryRecord(summary_text=result_summary, language=result.get("language", doc.get("language", "und")),
                                     mode=result.get("summary_mode", result.get("depth", "standard")), created_at=datetime.now(timezone.utc).replace(tzinfo=None),
-                                    result_data=_jsonable(result))
-            for index, claim in enumerate(result.get("claims", []) or [], 1):
+                                    result_data=_jsonable(persisted_result))
+            for index, claim in enumerate(persisted_result.get("claims", []) or [], 1):
                 summary.claims.append(SummaryClaimRecord(ordinal=index, claim=claim.get("claim", ""), category=claim.get("category"),
                     status=claim.get("status"), evidence=claim.get("evidence"), confidence=claim.get("confidence"), sources=_jsonable(claim.get("sources", []))))
             row.summaries.append(summary)
-            quality = result.get("quality", {}) or {}
-            if result.get("validation") or result.get("claims"):
+            session.flush()
+            evaluation = persisted_result.get("evaluation")
+            if owner_id is not None and isinstance(evaluation, dict):
+                metrics = evaluation.get("metrics") or {}
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                session.add(SummaryEvaluationRecord(
+                    document_id=doc_id, user_id=owner_id, summary_id=summary.id,
+                    summary_fingerprint=evaluation.get("summary_fingerprint"),
+                    evaluation_version=evaluation.get("evaluation_version", "deterministic-rubric-v1"),
+                    overall_score=evaluation.get("overall_score"),
+                    relevance_score=(metrics.get("relevance") or {}).get("score"),
+                    completeness_score=(metrics.get("completeness") or {}).get("score"),
+                    factual_consistency_score=(metrics.get("factual_consistency") or {}).get("score"),
+                    groundedness_score=(metrics.get("groundedness") or {}).get("score"),
+                    summary_quality_score=(metrics.get("summary_quality") or {}).get("score"),
+                    validation_accuracy_score=(metrics.get("validation_accuracy") or {}).get("score"),
+                    evaluation_status=evaluation.get("evaluation_status", "unavailable"),
+                    evaluation_details=_jsonable(evaluation), created_at=now, updated_at=now))
+            quality = persisted_result.get("quality", {}) or {}
+            if persisted_result.get("validation") or persisted_result.get("claims"):
                 row.validations.append(ValidationResultRecord(status=result.get("validation_status", result.get("status", "unavailable")),
                     groundedness_score=quality.get("groundedness"), created_at=datetime.now(timezone.utc).replace(tzinfo=None)))
-            translations = result.get("translations", {})
+            translations = persisted_result.get("translations", {})
             if isinstance(translations, dict):
                 for lang, translated in translations.items():
                     if isinstance(translated, str):
                         row.translations.append(TranslationRecord(source_language=doc.get("language", "und"), target_language=lang,
                             translated_text=translated, created_at=datetime.now(timezone.utc).replace(tzinfo=None)))
-            translated_summary = result.get("executive_summary", "")
+            translated_summary = result_summary
             result_language = result.get("language", doc.get("language", "und"))
             if translated_summary and result_language != doc.get("language", "und"):
                 row.translations.append(TranslationRecord(source_language=doc.get("language", "und"), target_language=result_language,
@@ -139,10 +155,19 @@ def get_document(document_id: str, user_id: int | None = None) -> dict[str, Any]
                         "language": c.language, "chunk_number": c.chunk_number, "source": c.source, "contains_ocr": c.contains_ocr,
                         "ocr_confidence": c.ocr_confidence, "embedding": c.embedding} for c in row.chunks],
             "ocr_records": row.ocr_records or [], "ocr_warnings": row.ocr_warnings or [], "ocr_detected": row.ocr_detected,
-            "options": row.options, "evaluation": row.evaluation, "reference_summary": row.reference_summary,
-            "dataset": row.dataset, "depth_comparison": row.depth_comparison,
+            "options": row.options,
             "result": ({**summary.result_data, "generated_at": summary.created_at.replace(tzinfo=timezone.utc).isoformat()} if summary else None), "audio_timings": row.audio_timings,
         }
+
+
+def get_latest_summary_evaluation(document_id: str, user_id: int) -> dict[str, Any] | None:
+    """Return the latest report only when both document and report ownership match."""
+    with SessionLocal() as session:
+        row = session.scalar(select(SummaryEvaluationRecord).where(
+            SummaryEvaluationRecord.document_id == document_id,
+            SummaryEvaluationRecord.user_id == user_id,
+        ).order_by(SummaryEvaluationRecord.summary_id.desc(), SummaryEvaluationRecord.id.desc()).limit(1))
+        return _jsonable(row.evaluation_details) if row else None
 
 
 def find_duplicate_document(user_id: int, content_sha256: str, extracted_text_sha256: str) -> bool:
@@ -200,7 +225,7 @@ def list_documents(user_id: int | None = None) -> list[dict[str, Any]]:
 
 
 def search_documents(user_id: int, query: str) -> list[dict[str, Any]]:
-    """Search one owner's persisted documents by name, language, metadata, or extracted text."""
+    """Search one owner's persisted documents by name, language, status, or extracted text."""
     term = query.strip().casefold()
     if not term:
         return list_documents(user_id)
@@ -210,7 +235,6 @@ def search_documents(user_id: int, query: str) -> list[dict[str, Any]]:
         func.lower(column).contains(term, autoescape=True)
         for column in (DocumentRecord.name, DocumentRecord.language, DocumentRecord.status, DocumentRecord.text)
     ]
-    predicates.append(func.lower(cast(DocumentRecord.dataset, String)).contains(term, autoescape=True))
     with SessionLocal() as session:
         page_count = select(func.count(DocumentPageRecord.id)).where(
             DocumentPageRecord.document_id == DocumentRecord.id
@@ -458,6 +482,8 @@ def list_history_documents(user_id: int, *, page: int = 1, limit: int = 20,
                 "processed_at": generated_at, "summary_status": summary_status,
                 "summary_type": result.get("summary_mode", result.get("depth")) if isinstance(result, dict) else None,
                 "validation_status": validation,
+                "overall_quality_score": ((result.get("evaluation") or {}).get("overall_score_rounded")
+                                          if isinstance(result.get("evaluation"), dict) else None),
                 "provider": provider.get("name") if isinstance(provider, dict) else None,
                 "model": provider.get("model") if isinstance(provider, dict) else None,
                 "fallback_used": provider.get("fallback_used") if isinstance(provider, dict) else None,

@@ -43,10 +43,6 @@ class DocumentRecord(Base):
     ocr_warnings: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     ocr_detected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     options: Mapped[dict | None] = mapped_column(JSON)
-    evaluation: Mapped[dict | None] = mapped_column(JSON)
-    reference_summary: Mapped[str | None] = mapped_column(LONGTEXT)
-    dataset: Mapped[dict | None] = mapped_column(JSON)
-    depth_comparison: Mapped[list | None] = mapped_column(JSON)
     audio_timings: Mapped[dict | None] = mapped_column(JSON)
     batch: Mapped["UploadBatchRecord | None"] = relationship(back_populates="documents", passive_deletes=True)
     history: Mapped[list["HistoryRecord"]] = relationship(back_populates="document", passive_deletes=True)
@@ -95,6 +91,28 @@ class SummaryRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     result_data: Mapped[dict] = mapped_column(JSON, nullable=False)
     claims: Mapped[list["SummaryClaimRecord"]] = relationship(cascade="all, delete-orphan")
+
+
+class SummaryEvaluationRecord(Base):
+    __tablename__ = "summary_evaluations"
+    __table_args__ = (UniqueConstraint("summary_id", "evaluation_version", name="uq_summary_evaluation_version"),)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    document_id: Mapped[str] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    summary_id: Mapped[int] = mapped_column(ForeignKey("summaries.id", ondelete="CASCADE"), nullable=False, index=True)
+    summary_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    evaluation_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    overall_score: Mapped[float | None] = mapped_column(Float)
+    relevance_score: Mapped[float | None] = mapped_column(Float)
+    completeness_score: Mapped[float | None] = mapped_column(Float)
+    factual_consistency_score: Mapped[float | None] = mapped_column(Float)
+    groundedness_score: Mapped[float | None] = mapped_column(Float)
+    summary_quality_score: Mapped[float | None] = mapped_column(Float)
+    validation_accuracy_score: Mapped[float | None] = mapped_column(Float)
+    evaluation_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    evaluation_details: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 class ValidationResultRecord(Base):

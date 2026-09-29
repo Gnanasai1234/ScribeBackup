@@ -6,10 +6,10 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.main import ProcessOptions, make_chunks, process_document, process_extractively
-from app.openrouter import (
+from app.llm_service import (
     LANGUAGE_SCRIPTS,
-    OpenRouterService,
-    summarize_with_openrouter,
+    LLMService,
+    summarize_document,
     translate_for_audio,
     verify_script,
 )
@@ -62,9 +62,9 @@ class TranslationPipelineTests(unittest.TestCase):
             "language": "te",
         }
 
-        mock_service = MagicMock(spec=OpenRouterService)
-        mock_service.provider_name = "openrouter"
-        mock_service.model = "openai/gpt-4o-mini"
+        mock_service = MagicMock(spec=LLMService)
+        mock_service.provider_name = "openai-gateway"
+        mock_service.model = "gpt-4o-mini"
 
         # Mock complete_json responses:
         # 1. Notes extraction
@@ -72,7 +72,7 @@ class TranslationPipelineTests(unittest.TestCase):
         # 3. Validation
         # 4. Translation into Kannada
         # 5. Cross-lingual validation
-        def mock_complete_json(system, user, max_tokens=1800):
+        def mock_complete_json(system, user, max_tokens=1800, **kwargs):
             if "Extract source-grounded notes" in system:
                 return {"notes": [{"text": self.telugu_sentence, "source_chunk_ids": ["chunk_001"]}]}
             elif "enterprise document intelligence platform" in system:
@@ -96,7 +96,7 @@ class TranslationPipelineTests(unittest.TestCase):
                         }
                     ]
                 }
-            elif "Translate the following content into Kannada" in system:
+            elif "into Kannada" in system:
                 # LLM correctly responds with Kannada claims
                 return {
                     "target_language": "Kannada",
@@ -108,7 +108,7 @@ class TranslationPipelineTests(unittest.TestCase):
 
         mock_service.complete_json.side_effect = mock_complete_json
 
-        result = summarize_with_openrouter(
+        result = summarize_document(
             doc,
             ProcessOptions(summary_depth="standard", purpose="Research", audience="Research team", language="kn"),
             mock_service,
@@ -134,11 +134,11 @@ class TranslationPipelineTests(unittest.TestCase):
             "language": "te",
         }
 
-        mock_service = MagicMock(spec=OpenRouterService)
-        mock_service.provider_name = "openrouter"
-        mock_service.model = "openai/gpt-4o-mini"
+        mock_service = MagicMock(spec=LLMService)
+        mock_service.provider_name = "openai-gateway"
+        mock_service.model = "gpt-4o-mini"
 
-        def mock_complete_json(system, user, max_tokens=1800):
+        def mock_complete_json(system, user, max_tokens=1800, **kwargs):
             if "Extract source-grounded notes" in system:
                 return {"notes": [{"text": self.telugu_sentence, "source_chunk_ids": ["chunk_001"]}]}
             elif "enterprise document intelligence platform" in system:
@@ -158,7 +158,7 @@ class TranslationPipelineTests(unittest.TestCase):
                         }
                     ]
                 }
-            elif "Translate the following content into Kannada" in system:
+            elif "into Kannada" in system:
                 return {
                     "validated_summary_fields": {
                         "findings": [self.kannada_sentence],
@@ -169,7 +169,7 @@ class TranslationPipelineTests(unittest.TestCase):
         mock_service.complete_json.side_effect = mock_complete_json
 
         # 1. First run with Telugu (same as doc source language)
-        res_te = summarize_with_openrouter(
+        res_te = summarize_document(
             doc,
             ProcessOptions(summary_depth="standard", purpose="Research", audience="Research team", language="te"),
             mock_service,
@@ -179,7 +179,7 @@ class TranslationPipelineTests(unittest.TestCase):
         self.assertFalse(self._has_script(res_te["executive_summary"], "kn"))
 
         # 2. Switch directly to Kannada
-        res_kn = summarize_with_openrouter(
+        res_kn = summarize_document(
             doc,
             ProcessOptions(summary_depth="standard", purpose="Research", audience="Research team", language="kn"),
             mock_service,
@@ -189,7 +189,7 @@ class TranslationPipelineTests(unittest.TestCase):
         self.assertFalse(self._has_script(res_kn["executive_summary"], "te"))
 
         # 3. Switch back to Telugu
-        res_te_again = summarize_with_openrouter(
+        res_te_again = summarize_document(
             doc,
             ProcessOptions(summary_depth="standard", purpose="Research", audience="Research team", language="te"),
             mock_service,
@@ -200,12 +200,12 @@ class TranslationPipelineTests(unittest.TestCase):
 
     def test_direct_target_generation_uses_target_language_before_translation(self):
         doc = {"id": "doc_direct", "text": self.english_sentence, "chunks": make_chunks(self.english_sentence, []), "pages": [], "language": "en"}
-        service = MagicMock(spec=OpenRouterService)
-        service.provider_name = "openrouter"
+        service = MagicMock(spec=LLMService)
+        service.provider_name = "openai-gateway"
         service.model = "mock"
         target_claim = self.telugu_sentence
 
-        def complete_json(system, user, max_tokens=1800):
+        def complete_json(system, user, max_tokens=1800, **kwargs):
             if "Extract source-grounded notes" in system:
                 return {"notes": [{"text": self.english_sentence, "source_chunk_ids": ["chunk_001"]}]}
             if "enterprise document intelligence platform" in system:
@@ -213,11 +213,11 @@ class TranslationPipelineTests(unittest.TestCase):
                 return {"findings": [{"text": target_claim, "source_chunk_ids": ["chunk_001"]}]}
             if "Validate each claim strictly" in system:
                 self.assertIn("Telugu", system)
-                return {"results": [{"id": "claim_01", "status": "SUPPORTED", "source_chunk_ids": ["chunk_001"], "reason": "à°†à°§à°¾à°°à°‚à°¤à±‹ à°¸à°°à°¿à°ªà±‹à°¤à±à°‚à°¦à°¿", "confidence": 0.9}]}
+                return {"results": [{"id": "claim_01", "status": "SUPPORTED", "source_chunk_ids": ["chunk_001"], "reason": "ఆధారాలతో సరిపోతుంది", "confidence": 0.9}]}
             self.fail(f"Unexpected model stage: {system[:100]}")
 
         service.complete_json.side_effect = complete_json
-        result = summarize_with_openrouter(doc, ProcessOptions(language="te"), service)
+        result = summarize_document(doc, ProcessOptions(language="te"), service)
         self.assertEqual(result["language"], "te")
         self.assertEqual(result["translation_validation_status"], "generated_directly_in_target_language")
         self.assertEqual(result["language_context"], {"source_language": "en", "requested_output_language": "te", "target_language": "te", "translation_required": True})
@@ -226,12 +226,12 @@ class TranslationPipelineTests(unittest.TestCase):
 
     def test_regeneration_keeps_direct_target_language(self):
         doc = {"id": "doc_direct_revision", "text": self.english_sentence, "chunks": make_chunks(self.english_sentence, []), "pages": [], "language": "en"}
-        service = MagicMock(spec=OpenRouterService)
-        service.provider_name = "openrouter"
+        service = MagicMock(spec=LLMService)
+        service.provider_name = "openai-gateway"
         service.model = "mock"
         validation_calls = 0
 
-        def complete_json(system, user, max_tokens=1800):
+        def complete_json(system, user, max_tokens=1800, **kwargs):
             nonlocal validation_calls
             if "Extract source-grounded notes" in system:
                 return {"notes": [{"text": self.english_sentence, "source_chunk_ids": ["chunk_001"]}]}
@@ -243,11 +243,11 @@ class TranslationPipelineTests(unittest.TestCase):
                 return {"findings": [{"text": self.telugu_sentence, "source_chunk_ids": ["chunk_001"]}]}
             if "Validate each claim strictly" in system:
                 validation_calls += 1
-                return {"results": [{"id": "claim_01", "status": "UNSUPPORTED" if validation_calls == 1 else "SUPPORTED", "source_chunk_ids": ["chunk_001"], "reason": "à°¸à°°à°¿à°ªà±‹à°¤à±à°‚à°¦à°¿", "confidence": 0.9}]}
+                return {"results": [{"id": "claim_01", "status": "UNSUPPORTED" if validation_calls == 1 else "SUPPORTED", "source_chunk_ids": ["chunk_001"], "reason": "ఆధారాలతో సరిపోతుంది", "confidence": 0.9}]}
             self.fail(f"Unexpected model stage: {system[:100]}")
 
         service.complete_json.side_effect = complete_json
-        result = summarize_with_openrouter(doc, ProcessOptions(language="te"), service)
+        result = summarize_document(doc, ProcessOptions(language="te"), service)
         self.assertEqual(result["language"], "te")
         self.assertEqual(result["stats"]["regeneration_count"], 1)
         self.assertEqual(result["claims"][0]["status"], "SUPPORTED")
@@ -266,11 +266,11 @@ class TranslationPipelineTests(unittest.TestCase):
         for source_lang, target_lang, source_text, target_sentence in cases:
             with self.subTest(source=source_lang, target=target_lang):
                 doc = {"id": f"doc_{source_lang}_{target_lang}", "text": source_text, "chunks": make_chunks(source_text, []), "pages": [], "language": source_lang}
-                service = MagicMock(spec=OpenRouterService)
-                service.provider_name = "openrouter"
+                service = MagicMock(spec=LLMService)
+                service.provider_name = "openai-gateway"
                 service.model = "mock"
 
-                def complete_json(system, user, max_tokens=1800):
+                def complete_json(system, user, max_tokens=1800, **kwargs):
                     if "Extract source-grounded notes" in system:
                         return {"notes": [{"text": source_text, "source_chunk_ids": ["chunk_001"]}]}
                     if "enterprise document intelligence platform" in system:
@@ -281,7 +281,7 @@ class TranslationPipelineTests(unittest.TestCase):
                     self.fail(f"Unexpected model stage: {system[:100]}")
 
                 service.complete_json.side_effect = complete_json
-                result = summarize_with_openrouter(doc, ProcessOptions(language=target_lang), service)
+                result = summarize_document(doc, ProcessOptions(language=target_lang), service)
                 self.assertEqual(result["language"], target_lang)
                 self.assertEqual(result["source_language"], source_lang)
                 self.assertTrue(verify_script(result["executive_summary"], target_lang))
@@ -292,18 +292,18 @@ class TranslationPipelineTests(unittest.TestCase):
 
     def test_translation_validation_failure_falls_back_without_regeneration(self):
         doc = {"id": "doc_mismatch", "text": self.telugu_text, "chunks": make_chunks(self.telugu_text, []), "pages": [], "language": "te"}
-        service = MagicMock(spec=OpenRouterService)
-        service.provider_name = "openrouter"
+        service = MagicMock(spec=LLMService)
+        service.provider_name = "openai-gateway"
         service.model = "mock"
         validation_calls = 0
 
-        def complete_json(system, user, max_tokens=1800):
+        def complete_json(system, user, max_tokens=1800, **kwargs):
             nonlocal validation_calls
             if "Extract source-grounded notes" in system:
                 return {"notes": [{"text": self.telugu_sentence, "source_chunk_ids": ["chunk_001"]}]}
             if "enterprise document intelligence platform" in system:
                 return {"findings": [{"text": self.telugu_sentence, "source_chunk_ids": ["chunk_001"]}]}
-            if "Translate the following content into Kannada" in system:
+            if "into Kannada" in system:
                 return {"findings": [self.kannada_sentence]}
             if "Validate each claim strictly" in system:
                 validation_calls += 1
@@ -313,10 +313,9 @@ class TranslationPipelineTests(unittest.TestCase):
             self.fail(f"Unexpected model stage: {system[:100]}")
 
         service.complete_json.side_effect = complete_json
-        with patch("app.openrouter._get_fallback_llm_service", return_value=None):
-            result = summarize_with_openrouter(doc, ProcessOptions(language="kn"), service)
+        result = summarize_document(doc, ProcessOptions(language="kn"), service)
         self.assertEqual(result["language"], "te")
-        self.assertEqual(result["translation_validation_status"], "translation_validation_failed_source_fallback")
+        self.assertEqual(result["translation_validation_status"], "translation_unavailable_source_fallback")
         self.assertEqual(result["claims"][0]["status"], "SUPPORTED")
         self.assertTrue(self._has_script(result["claims"][0]["claim"], "te"))
         self.assertEqual(result["stats"]["regeneration_count"], 0)
@@ -324,11 +323,11 @@ class TranslationPipelineTests(unittest.TestCase):
 
     def test_validation_provider_failure_retries_three_times_and_keeps_summary(self):
         doc = {"id": "doc_validation_unavailable", "text": self.english_sentence, "chunks": make_chunks(self.english_sentence, []), "pages": [], "language": "en"}
-        service = MagicMock(spec=OpenRouterService)
-        service.provider_name = "openrouter"
+        service = MagicMock(spec=LLMService)
+        service.provider_name = "openai-gateway"
         service.model = "mock"
 
-        def complete_json(system, user, max_tokens=1800):
+        def complete_json(system, user, max_tokens=1800, **kwargs):
             if "Extract source-grounded notes" in system:
                 return {"notes": [{"text": self.english_sentence, "source_chunk_ids": ["chunk_001"]}]}
             if "enterprise document intelligence platform" in system:
@@ -338,7 +337,7 @@ class TranslationPipelineTests(unittest.TestCase):
             self.fail(f"Unexpected model stage: {system[:100]}")
 
         service.complete_json.side_effect = complete_json
-        result = summarize_with_openrouter(doc, ProcessOptions(language="en"), service)
+        result = summarize_document(doc, ProcessOptions(language="en"), service)
         self.assertEqual(result["language"], "en")
         self.assertEqual(result["validation_status"], "unavailable")
         self.assertEqual(result["claims"][0]["status"], "UNCERTAIN")
@@ -349,13 +348,13 @@ class TranslationPipelineTests(unittest.TestCase):
 
     def test_validation_stops_after_three_attempts_and_returns_latest_summary(self):
         doc = {"id": "doc_validation_partial", "text": self.english_sentence, "chunks": make_chunks(self.english_sentence, []), "pages": [], "language": "en"}
-        service = MagicMock(spec=OpenRouterService)
-        service.provider_name = "openrouter"
+        service = MagicMock(spec=LLMService)
+        service.provider_name = "openai-gateway"
         service.model = "mock"
         validation_calls = 0
         regenerations = 0
 
-        def complete_json(system, user, max_tokens=1800):
+        def complete_json(system, user, max_tokens=1800, **kwargs):
             nonlocal validation_calls, regenerations
             if "Extract source-grounded notes" in system:
                 return {"notes": [{"text": self.english_sentence, "source_chunk_ids": ["chunk_001"]}]}
@@ -374,7 +373,7 @@ class TranslationPipelineTests(unittest.TestCase):
             self.fail(f"Unexpected model stage: {system[:100]}")
 
         service.complete_json.side_effect = complete_json
-        result = summarize_with_openrouter(doc, ProcessOptions(language="en"), service)
+        result = summarize_document(doc, ProcessOptions(language="en"), service)
         self.assertEqual(validation_calls, 3)
         self.assertEqual(regenerations, 2)
         self.assertEqual(result["stats"]["validation_attempts"], 3)
@@ -385,12 +384,12 @@ class TranslationPipelineTests(unittest.TestCase):
 
     def test_zero_claims_is_distinct_from_validation_unavailable(self):
         doc = {"id": "doc_no_claims", "text": self.english_sentence, "chunks": make_chunks(self.english_sentence, []), "pages": [], "language": "en"}
-        service = MagicMock(spec=OpenRouterService)
-        service.provider_name = "openrouter"
+        service = MagicMock(spec=LLMService)
+        service.provider_name = "openai-gateway"
         service.model = "mock"
         validation_calls = 0
 
-        def complete_json(system, user, max_tokens=1800):
+        def complete_json(system, user, max_tokens=1800, **kwargs):
             nonlocal validation_calls
             if "Extract source-grounded notes" in system:
                 return {"notes": [{"text": self.english_sentence, "source_chunk_ids": ["chunk_001"]}]}
@@ -401,7 +400,7 @@ class TranslationPipelineTests(unittest.TestCase):
             self.fail(f"Unexpected model stage: {system[:100]}")
 
         service.complete_json.side_effect = complete_json
-        result = summarize_with_openrouter(doc, ProcessOptions(language="en"), service)
+        result = summarize_document(doc, ProcessOptions(language="en"), service)
         self.assertEqual(result["validation_status"], "no_claims")
         self.assertEqual(result["source_validation_status"], "no_claims")
         self.assertEqual(result["claims"], [])
@@ -419,12 +418,12 @@ class TranslationPipelineTests(unittest.TestCase):
             "language": "te",
         }
 
-        mock_service = MagicMock(spec=OpenRouterService)
-        mock_service.provider_name = "openrouter"
-        mock_service.model = "openai/gpt-4o-mini"
+        mock_service = MagicMock(spec=LLMService)
+        mock_service.provider_name = "openai-gateway"
+        mock_service.model = "gpt-4o-mini"
 
         # Model erroneously returns Telugu text for a Kannada translation request
-        def mock_complete_json(system, user, max_tokens=1800):
+        def mock_complete_json(system, user, max_tokens=1800, **kwargs):
             if "Extract source-grounded notes" in system:
                 return {"notes": [{"text": self.telugu_sentence, "source_chunk_ids": ["chunk_001"]}]}
             elif "enterprise document intelligence platform" in system:
@@ -444,7 +443,7 @@ class TranslationPipelineTests(unittest.TestCase):
                         }
                     ]
                 }
-            elif "Translate the following content into Kannada" in system:
+            elif "into Kannada" in system:
                 # Returns Telugu text erroneously instead of Kannada
                 return {
                     "validated_summary_fields": {
@@ -456,12 +455,11 @@ class TranslationPipelineTests(unittest.TestCase):
         mock_service.complete_json.side_effect = mock_complete_json
 
         # Ensure fallback LLM service is not providing Kannada here
-        with patch("app.openrouter._get_fallback_llm_service", return_value=None):
-            result = summarize_with_openrouter(
-                doc,
-                ProcessOptions(summary_depth="standard", purpose="Research", audience="Research team", language="kn"),
-                mock_service,
-            )
+        result = summarize_document(
+            doc,
+            ProcessOptions(summary_depth="standard", purpose="Research", audience="Research team", language="kn"),
+            mock_service,
+        )
 
         self.assertEqual(result["language"], "te")
         self.assertEqual(result["requested_language"], "kn")
@@ -484,7 +482,7 @@ class TranslationPipelineTests(unittest.TestCase):
             ProcessOptions(summary_depth="standard", purpose="Research", audience="Research team", language="kn"),
         )
 
-        self.assertIn(result["status"], {"validated", "partial"})
+        self.assertIn(result["status"], {"validated", "partial", "translation_unavailable"})
         self.assertTrue(result["executive_summary"])
         self.assertEqual(result["requested_language"], "kn")
         self.assertEqual(result["source_language"], "te")
@@ -494,8 +492,8 @@ class TranslationPipelineTests(unittest.TestCase):
 
     def test_translate_for_audio_strictly_checks_script(self):
         """translate_for_audio must strictly verify the output script and reject wrong language output."""
-        mock_service = MagicMock(spec=OpenRouterService)
-        mock_service.provider_name = "openrouter"
+        mock_service = MagicMock(spec=LLMService)
+        mock_service.provider_name = "openai-gateway"
         mock_service.complete.return_value = self.kannada_sentence
 
         # Kannada translation returns Kannada script
@@ -504,19 +502,18 @@ class TranslationPipelineTests(unittest.TestCase):
 
         # If LLM returns Telugu for a Kannada audio translation request, it must raise ValueError
         mock_service.complete.return_value = self.telugu_sentence
-        with patch("app.openrouter._get_fallback_llm_service", return_value=None):
-            with self.assertRaises(ValueError) as ctx:
-                translate_for_audio("Some English text", "kn", mock_service)
-            self.assertIn("Kannada translation is currently unavailable", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            translate_for_audio("Some English text", "kn", mock_service)
+        self.assertIn("Kannada translation is currently unavailable", str(ctx.exception))
 
 
-    def test_local_translation_fallback_preserves_telugu_to_hindi_direction(self):
+    def test_translation_failure_preserves_source_language_with_single_service_interface(self):
         doc = {"id": "doc_local_te_hi", "text": self.telugu_text, "chunks": make_chunks(self.telugu_text, []), "pages": [], "language": "te"}
-        primary = MagicMock(spec=OpenRouterService)
-        primary.provider_name = "openrouter"
+        primary = MagicMock(spec=LLMService)
+        primary.provider_name = "openai-gateway"
         primary.model = "mock"
 
-        def primary_json(system, user, max_tokens=1800):
+        def primary_json(system, user, max_tokens=1800, **kwargs):
             if "Extract source-grounded notes" in system:
                 return {"notes": [{"text": self.telugu_sentence, "source_chunk_ids": ["chunk_001"]}]}
             if "enterprise document intelligence platform" in system:
@@ -525,28 +522,16 @@ class TranslationPipelineTests(unittest.TestCase):
             if "Validate each claim strictly" in system:
                 claims = json.loads(user)["claims"]
                 return {"results": [{"id": c["id"], "status": "SUPPORTED", "source_chunk_ids": c["cited_chunk_ids"], "reason": "validated", "confidence": 0.9} for c in claims]}
-            if "Translate the following content into Hindi" in system:
+            if "into Hindi" in system:
                 raise RuntimeError("primary translation unavailable")
             self.fail(f"Unexpected primary stage: {system[:100]}")
 
         primary.complete_json.side_effect = primary_json
-        local = MagicMock()
-        local.provider_name = "ollama-local"
-        local.model = "llama-local"
-        hindi = self.hindi_sentence
-        def local_json(system, user, max_tokens=1800):
-            payload = json.loads(user)
-            self.assertEqual(payload["source_language"], "te")
-            self.assertEqual(payload["target_language"], "hi")
-            return {"findings": [hindi]}
-        local.complete_json.side_effect = local_json
+        result = summarize_document(doc, ProcessOptions(language="hi"), primary)
 
-        with patch("app.openrouter.get_local_llm_service", return_value=local), patch("app.openrouter._get_fallback_llm_service", return_value=None):
-            result = summarize_with_openrouter(doc, ProcessOptions(language="hi"), primary)
-
-        self.assertEqual(result["language"], "hi")
-        self.assertEqual(result["translation_provider"], "ollama-local")
-        self.assertTrue(self._has_script(result["executive_summary"], "hi"))
+        self.assertEqual(result["language"], "te")
+        self.assertEqual(result["translation_validation_status"], "translation_unavailable_source_fallback")
+        self.assertTrue(self._has_script(result["executive_summary"], "te"))
 
 if __name__ == "__main__":
     unittest.main()

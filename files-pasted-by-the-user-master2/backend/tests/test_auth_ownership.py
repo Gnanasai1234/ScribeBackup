@@ -110,7 +110,6 @@ class AuthOwnershipTests(unittest.TestCase):
         unauthenticated = TestClient(app)
         self.assertEqual(unauthenticated.get("/api/documents").status_code, 401)
         self.assertEqual(unauthenticated.get("/api/documents/alice-doc").status_code, 401)
-        self.assertEqual(unauthenticated.get("/api/dataset/govreport").status_code, 401)
 
     def test_same_content_is_private_duplicate_per_user(self):
         self.register_and_login("Alice", "alice@example.com")

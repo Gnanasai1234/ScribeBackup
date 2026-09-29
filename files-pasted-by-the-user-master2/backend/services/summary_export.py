@@ -52,6 +52,8 @@ def make_export_payload(document: dict[str, Any], result: dict[str, Any]) -> dic
     if isinstance(result.get("quality"), dict):
         payload["supported_claims"] = int(result.get("supported_claims_count", 0) or 0)
         payload["unverified_claims"] = int(result.get("unsupported_claims_count", 0) or 0)
+    if isinstance(result.get("evaluation"), dict):
+        payload["summary_quality_evaluation"] = result["evaluation"]
     for source_key, export_key in _SECTION_FIELDS:
         value = result.get(source_key)
         if isinstance(value, str) and value.strip():
@@ -114,6 +116,27 @@ def _display_label(key: str) -> str:
     return key.replace("_", " ").strip().title()
 
 
+def _evaluation_report_lines(evaluation: dict[str, Any]) -> list[str]:
+    lines = [f"Evaluation status: {str(evaluation.get('evaluation_status', 'unavailable')).upper()}"]
+    overall = evaluation.get("overall_score_rounded")
+    lines.append(f"Overall score: {overall}%" if overall is not None else "Overall score: N/A")
+    for key, metric in (evaluation.get("metrics") or {}).items():
+        if not isinstance(metric, dict):
+            continue
+        score = metric.get("score")
+        lines.append(f"{_display_label(key)}: {score:.0f}%" if isinstance(score, (int, float)) else f"{_display_label(key)}: N/A")
+        if metric.get("explanation"):
+            lines.append(f"  {metric['explanation']}")
+    claims = evaluation.get("claims") or []
+    if claims:
+        lines.append(f"Claims analyzed: {len(claims)}")
+        for claim in claims[:50]:
+            lines.append(f"- {claim.get('validation_result', 'UNAVAILABLE')}: {claim.get('claim', '')}")
+            for item in (claim.get("source_evidence") or [])[:2]:
+                lines.append(f"  Source evidence: {item}")
+    return lines
+
+
 def _render_markdown(payload: dict[str, Any]) -> str:
     lines = [f"# {payload['document']}", "", f"**Original file:** {payload['original_file_name']}"]
     if payload.get("language"):
@@ -127,8 +150,10 @@ def _render_markdown(payload: dict[str, Any]) -> str:
     if "supported_claims" in payload:
         lines.append(f"**Claims verified:** {payload['supported_claims']} · **Unverified:** {payload.get('unverified_claims', 0)}")
     lines.extend([f"**Generated:** {payload['generated_at']}", "", "## Summary", "", payload["summary"]])
+    if isinstance(payload.get("summary_quality_evaluation"), dict):
+        lines.extend(["", "## Summary Quality Evaluation", "", *[f"- {line}" for line in _evaluation_report_lines(payload["summary_quality_evaluation"]) ]])
     for key, value in payload.items():
-        if key in {"document", "original_file_name", "language", "summary_depth", "generated_at", "summary", "validation_state", "validation_warning", "supported_claims", "unverified_claims"}:
+        if key in {"document", "original_file_name", "language", "summary_depth", "generated_at", "summary", "validation_state", "validation_warning", "supported_claims", "unverified_claims", "summary_quality_evaluation"}:
             continue
         label = _display_label(key)
         if key == "documents_included" and isinstance(value, list):
@@ -158,8 +183,10 @@ def _render_text(payload: dict[str, Any]) -> str:
     if "supported_claims" in payload:
         lines.append(f"Claims verified: {payload['supported_claims']} | Unverified: {payload.get('unverified_claims', 0)}")
     lines.extend([f"Generated: {payload['generated_at']}", "", "Summary", "-------", payload["summary"]])
+    if isinstance(payload.get("summary_quality_evaluation"), dict):
+        lines.extend(["", "Summary Quality Evaluation", "-------------------------", *_evaluation_report_lines(payload["summary_quality_evaluation"])])
     for key, value in payload.items():
-        if key in {"document", "original_file_name", "language", "summary_depth", "generated_at", "summary", "validation_state", "validation_warning", "supported_claims", "unverified_claims"}:
+        if key in {"document", "original_file_name", "language", "summary_depth", "generated_at", "summary", "validation_state", "validation_warning", "supported_claims", "unverified_claims", "summary_quality_evaluation"}:
             continue
         lines.extend(["", _display_label(key), "-" * min(len(_display_label(key)), 72)])
         if key == "documents_included" and isinstance(value, list):
@@ -210,8 +237,12 @@ def _render_docx(payload: dict[str, Any]) -> bytes:
     metadata_paragraph.style = document.styles["Subtitle"]
     document.add_heading("Summary", level=1)
     document.add_paragraph(payload["summary"])
+    if isinstance(payload.get("summary_quality_evaluation"), dict):
+        document.add_heading("Summary Quality Evaluation", level=1)
+        for line in _evaluation_report_lines(payload["summary_quality_evaluation"]):
+            document.add_paragraph(line, style="List Bullet" if line.startswith("-") else "Normal")
     for key, value in payload.items():
-        if key in {"document", "original_file_name", "language", "summary_depth", "generated_at", "summary", "validation_state", "validation_warning", "supported_claims", "unverified_claims"}:
+        if key in {"document", "original_file_name", "language", "summary_depth", "generated_at", "summary", "validation_state", "validation_warning", "supported_claims", "unverified_claims", "summary_quality_evaluation"}:
             continue
         document.add_heading(_display_label(key), level=1)
         if key == "documents_included" and isinstance(value, list):
@@ -249,8 +280,10 @@ def _render_pdf(payload: dict[str, Any]) -> bytes:
         pieces.append(f"<p class='meta'><b>Claims verified:</b> {int(payload['supported_claims'])} | <b>Unverified:</b> {int(payload.get('unverified_claims', 0))}</p>")
     pieces.extend([f"<p class='meta'><b>Generated:</b> {escape(str(payload['generated_at']))}</p>",
                    "<h2>Summary</h2>", f"<p>{escape(payload['summary']).replace(chr(10), '<br>')}</p>"])
+    if isinstance(payload.get("summary_quality_evaluation"), dict):
+        pieces.append("<h2>Summary Quality Evaluation</h2><ul>" + "".join(f"<li>{escape(line)}</li>" for line in _evaluation_report_lines(payload["summary_quality_evaluation"])) + "</ul>")
     for key, value in payload.items():
-        if key in {"document", "original_file_name", "language", "summary_depth", "generated_at", "summary", "validation_state", "validation_warning", "supported_claims", "unverified_claims"}:
+        if key in {"document", "original_file_name", "language", "summary_depth", "generated_at", "summary", "validation_state", "validation_warning", "supported_claims", "unverified_claims", "summary_quality_evaluation"}:
             continue
         pieces.append(f"<h2>{escape(_display_label(key))}</h2>")
         if key == "documents_included" and isinstance(value, list):

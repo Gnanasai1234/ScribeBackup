@@ -12,6 +12,36 @@ from pathlib import PurePath
 from typing import Any
 
 
+MIN_USABLE_SUMMARY_CHARS = 12
+
+
+def summary_text(value: Any) -> str:
+    """Extract readable summary text from plain or structured model output."""
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return text
+            if isinstance(parsed, (dict, list)):
+                return summary_text(parsed)
+        return text
+    if isinstance(value, list):
+        parts = [summary_text(item) for item in value]
+        return " ".join(part for part in parts if part)
+    if isinstance(value, dict):
+        preferred = ("executive_summary", "summary", "overview", "text", "key_findings", "findings", "facts", "risks", "decisions", "recommendations", "action_items")
+        parts = [summary_text(value[key]) for key in preferred if key in value]
+        return " ".join(part for part in parts if part)
+    return ""
+
+
+def is_usable_summary(value: Any) -> bool:
+    """Return whether a summary contains enough non-whitespace text to display."""
+    return isinstance(value, str) and len(value.strip()) >= MIN_USABLE_SUMMARY_CHARS
+
+
 def config_int(name: str, default: int, minimum: int = 1) -> int:
     try:
         return max(minimum, int(os.getenv(name, str(default))))
@@ -20,7 +50,7 @@ def config_int(name: str, default: int, minimum: int = 1) -> int:
 
 
 def llm_retry_limit() -> int:
-    raw = os.getenv("MAX_LLM_RETRIES", os.getenv("LLM_MAX_RETRIES", os.getenv("OPENROUTER_MAX_RETRIES", "1")))
+    raw = os.getenv("MAX_LLM_RETRIES", os.getenv("LLM_MAX_RETRIES", "1"))
     try:
         return max(0, int(raw))
     except (TypeError, ValueError):

@@ -20,6 +20,8 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 Tables store documents, pages, chunks, summaries, summary claims, validation results, translations, audio metadata, and Q&A history. Extracted text, summary, claim, translation, and narration text use MySQL `LONGTEXT`; document text is stored in relational document rows and chunks in individual rows. Files remain in the configured local storage system.
 
+Migration `0009_summary_evaluations.py` adds owner-scoped evaluation rows keyed to a specific `summary_id` and evaluator version. Each row stores nullable metric scores and the complete JSON report. Reprocessing appends a summary and evaluation version instead of deleting the previous summary history. Apply it with the full migration chain before serving the new evaluation endpoint.
+
 Migration `0002_users_and_document_ownership.py` adds users and a nullable `documents.user_id` foreign key. Existing rows are left with `user_id = NULL`; Scribe does not assign them to the first account. Assign only selected legacy rows after registering an account:
 
 ```sql

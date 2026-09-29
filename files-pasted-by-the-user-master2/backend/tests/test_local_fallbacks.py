@@ -73,7 +73,7 @@ class LocalFallbackTests(unittest.TestCase):
         self.assertEqual(payload["model"], "llama3.2:1b")
         self.assertIn("Say OK", payload["prompt"])
         self.assertIs(payload["stream"], False)
-        self.assertEqual(urlopen.call_args.kwargs["timeout"], 120.0)
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 90.0)
 
     def test_generation_bounds_large_pipeline_output_limit(self):
         with patch.dict("os.environ", {"OLLAMA_MAX_OUTPUT_TOKENS": "300"}), \

@@ -5,10 +5,21 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.main import ProcessOptions, detect_language, extract_text, make_chunks, normalize, process_document, process_extractively, resolve_summary_depth
-from app.openrouter import summarize_with_openrouter
+from app.llm_service import summarize_document
+from services.guardrails import is_usable_summary, summary_text
 
 
 class PipelineTests(unittest.TestCase):
+    def test_summary_usability_and_structured_response_extraction(self):
+        structured = {"executive_summary": "A concise overview of the principal finding.", "key_findings": ["The board approved the safety pilot."]}
+        extracted = summary_text(structured)
+        self.assertIn("principal finding", extracted)
+        self.assertIn("approved the safety pilot", extracted)
+        self.assertTrue(is_usable_summary(extracted))
+        self.assertFalse(is_usable_summary(None))
+        self.assertFalse(is_usable_summary("   "))
+        self.assertFalse(is_usable_summary("short"))
+
     def test_summary_depth_request_and_auto_resolution(self):
         self.assertEqual(ProcessOptions.model_validate({"summary_depth": "deep"}).summary_depth, "deep")
         self.assertEqual(ProcessOptions.model_validate({"depth": "quick"}).summary_depth, "quick")
@@ -29,7 +40,8 @@ class PipelineTests(unittest.TestCase):
     def test_process_claims_are_source_linked_and_validated(self):
         text = "The board approved a two-year service pilot. The pilot will be reviewed every quarter."
         doc = {"text": text, "chunks": make_chunks(text, []), "pages": [], "language": "en"}
-        with patch("app.main.OpenRouterService", side_effect=RuntimeError("Deterministic unit test")):
+        service = type("Service", (), {"provider_metadata": {"name": None, "model": None, "fallback_used": True}, "provider_name": "openai-gateway", "model": "gpt-4o-mini"})()
+        with patch("app.main.LLMService", return_value=service), patch("app.main.summarize_document", side_effect=RuntimeError("Deterministic unit test")):
             result = process_document(doc, ProcessOptions(depth="quick"))
         self.assertEqual(result["status"], "validated")
         self.assertTrue(result["claims"])
@@ -47,7 +59,8 @@ class PipelineTests(unittest.TestCase):
     def test_backend_state_keeps_depth_purpose_audience_and_requested_language(self):
         text = "The agency identified a substantial cybersecurity risk requiring mitigation before deployment."
         doc = {"text": text, "chunks": make_chunks(text, []), "pages": [], "language": "en"}
-        with unittest.mock.patch("app.main.OpenRouterService", side_effect=RuntimeError("No configured provider")):
+        service = type("Service", (), {"provider_metadata": {"name": None, "model": None, "fallback_used": True}, "provider_name": "openai-gateway", "model": "gpt-4o-mini"})()
+        with unittest.mock.patch("app.main.LLMService", return_value=service), unittest.mock.patch("app.main.summarize_document", side_effect=RuntimeError("No configured provider")):
             result = process_document(doc, ProcessOptions(summary_depth="deep", purpose="Risk analysis", audience="Technical audience", language="te"))
         self.assertEqual(result["summary_mode"], "deep")
         self.assertEqual(result["summary_depth_resolved"], "deep")
@@ -71,8 +84,8 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(detect_language("తెలుగు భాష మరియు పత్రం English language"), "te")
         self.assertEqual(detect_language("12345 !!!"), "und")
 
-    def test_openrouter_summary_requires_validated_source_claims(self):
-        class FakeOpenRouter:
+    def test_llm_summary_requires_validated_source_claims(self):
+        class FakeOpenAI:
             model = "test/fake"
 
             def complete_json(self, system, user, **kwargs):
@@ -88,7 +101,7 @@ class PipelineTests(unittest.TestCase):
 
         text = "The board approved a two-year service pilot."
         doc = {"text": text, "chunks": [{"id": "chunk_001", "text": text, "page": 1, "section": "Decision", "language": "en"}], "pages": [{"page": 1}], "language": "en"}
-        result = summarize_with_openrouter(doc, ProcessOptions(depth="quick"), FakeOpenRouter())
+        result = summarize_document(doc, ProcessOptions(depth="quick"), FakeOpenAI())
         self.assertEqual(result["status"], "validated")
         self.assertNotIn("UNTRUSTED", result["executive_summary"])
         self.assertEqual(result["claims"][0]["sources"][0]["chunk_id"], "chunk_001")
@@ -97,7 +110,7 @@ class PipelineTests(unittest.TestCase):
         import json
 
         class FakeOllama:
-            provider_name = "ollama-local"
+            provider_name = "ollama"
             model = "llama3.2:1b"
             def __init__(self): self.calls = 0
             def complete_json(self, system, user, **kwargs):
@@ -106,8 +119,15 @@ class PipelineTests(unittest.TestCase):
                 if "passages" in payload:
                     passage = payload["passages"][0]
                     return {"notes": [{"text": passage["text"], "source_chunk_ids": [passage["chunk_id"]]}]}
+                if "claims" in payload:
+                    return {"results": [
+                        {"id": item["id"], "status": "SUPPORTED" if "board approved" in item["claim"].lower() else "UNSUPPORTED",
+                         "source_chunk_ids": item["cited_chunk_ids"] if "board approved" in item["claim"].lower() else [],
+                         "reason": "Validated against the source."}
+                        for item in payload["claims"]
+                    ]}
                 return {
-                    "executive_summary": "Unsupported draft text must not appear.",
+                    "executive_summary": "The board approved a two-year service pilot.",
                     "findings": [{"text": "The board approved a two-year service pilot.", "source_chunk_ids": ["chunk_001"]}],
                     "risks": [{"text": "The software platform has major security weaknesses.", "source_chunk_ids": ["chunk_001"]}],
                 }
@@ -115,16 +135,16 @@ class PipelineTests(unittest.TestCase):
         text = "The board approved a two-year service pilot."
         doc = {"text": text, "chunks": [{"id": "chunk_001", "text": text, "page": 1, "section": "Decision", "language": "en"}], "pages": [], "language": "en"}
         service = FakeOllama()
-        result = summarize_with_openrouter(doc, ProcessOptions(summary_depth="quick"), service)
-        self.assertEqual(service.calls, 2, "local provider should map and synthesize without repeated model self-validation")
+        result = summarize_document(doc, ProcessOptions(summary_depth="quick"), service)
+        self.assertGreaterEqual(service.calls, 3, "Ollama fallback also performs semantic claim validation")
         self.assertEqual(result["executive_summary"], text)
-        self.assertEqual([claim["claim"] for claim in result["claims"]], [text])
-        self.assertTrue(all(claim["status"] == "SUPPORTED" for claim in result["claims"]))
+        self.assertEqual([claim["claim"] for claim in result["claims"]], [text, "The software platform has major security weaknesses."])
+        self.assertEqual([claim["status"] for claim in result["claims"]], ["SUPPORTED", "UNSUPPORTED"])
 
-    def test_openrouter_depth_changes_context_prompt_and_generation_capacity(self):
+    def test_llm_depth_changes_context_prompt_and_generation_capacity(self):
         import json
 
-        class CapturingOpenRouter:
+        class CapturingOpenAI:
             model = "test/fake"
 
             def __init__(self):
@@ -142,9 +162,9 @@ class PipelineTests(unittest.TestCase):
 
         chunks = [{"id": f"chunk_{i:03d}", "text": f"Section {i} contains substantive evidence and a distinct operational finding." , "page": i, "section": f"Section {i}", "language": "en"} for i in range(1, 10)]
         doc = {"text": " ".join(c["text"] for c in chunks), "chunks": chunks, "pages": [], "language": "en"}
-        quick_service, deep_service = CapturingOpenRouter(), CapturingOpenRouter()
-        quick = summarize_with_openrouter(doc, ProcessOptions(summary_depth="quick"), quick_service)
-        deep = summarize_with_openrouter(doc, ProcessOptions(summary_depth="deep"), deep_service)
+        quick_service, deep_service = CapturingOpenAI(), CapturingOpenAI()
+        quick = summarize_document(doc, ProcessOptions(summary_depth="quick"), quick_service)
+        deep = summarize_document(doc, ProcessOptions(summary_depth="deep"), deep_service)
         quick_generation = next(c for c in quick_service.calls if "source_notes" in c[1])
         deep_generation = next(c for c in deep_service.calls if "source_notes" in c[1])
         self.assertLess(len(quick_generation[1]["source_notes"]), len(deep_generation[1]["source_notes"]))
@@ -172,7 +192,7 @@ class PipelineTests(unittest.TestCase):
         text = "The agency identified a substantial cybersecurity risk requiring mitigation before deployment."
         doc = {"text": text, "chunks": [{"id": "chunk_001", "text": text, "page": 3, "section": "Risk", "language": "en"}], "pages": [], "language": "en"}
         service = Capture()
-        result = summarize_with_openrouter(doc, ProcessOptions(summary_depth="standard", purpose="Risk analysis", audience="Technical audience"), service)
+        result = summarize_document(doc, ProcessOptions(summary_depth="standard", purpose="Risk analysis", audience="Technical audience"), service)
         system, payload = service.synthesis
         self.assertIn("threats", payload["purpose_instructions"])
         self.assertIn("technical terminology", payload["audience_instructions"])
@@ -202,7 +222,7 @@ class PipelineTests(unittest.TestCase):
         text = "The agency identified a substantial cybersecurity risk requiring mitigation before deployment."
         doc = {"text": text, "chunks": [{"id": "chunk_001", "text": text, "page": 3, "section": "Risk", "language": "en"}], "pages": [], "language": "en"}
         service = Translator()
-        result = summarize_with_openrouter(doc, ProcessOptions(summary_depth="standard", language="te"), service)
+        result = summarize_document(doc, ProcessOptions(summary_depth="standard", language="te"), service)
         self.assertEqual(result["language"], "te")
         self.assertEqual(result["translation_validation_status"], "validated_against_original_report")
         self.assertTrue(any("సైబర్" in claim for claim in service.validation_languages))

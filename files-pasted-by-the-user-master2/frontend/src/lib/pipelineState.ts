@@ -6,25 +6,26 @@ export type PipelineInputs = {
   busy: boolean
   error: boolean
   resultStatus: string | null | undefined // 'validated' | 'partial' | 'failed' | undefined
+  summaryUsable?: boolean
   validationState?: string | null
   regenerationCount: number
   audioActive: boolean // audio currently generated/playing
 }
 
 /** Derives the seven pipeline node states from real, already-fetched app state. */
-export function derivePipelineSteps({ hasDoc, busy, error, resultStatus, validationState, regenerationCount, audioActive }: PipelineInputs): PipelineStep[] {
-  const summarized = resultStatus === 'validated' || resultStatus === 'partial' || resultStatus === 'translation_unavailable'
-  const validationComplete = validationState === 'VALIDATED' || validationState === 'NO_CLAIMS' || (!validationState && resultStatus === 'validated')
-  const failedResult = resultStatus === 'failed'
+export function derivePipelineSteps({ hasDoc, busy, error, resultStatus, summaryUsable, validationState, regenerationCount, audioActive }: PipelineInputs): PipelineStep[] {
+  const summarized = summaryUsable ?? (resultStatus === 'validated' || resultStatus === 'partial' || resultStatus === 'translation_unavailable')
+  const validationComplete = summarized && (validationState === 'VALIDATED' || validationState === 'NO_CLAIMS' || (!validationState && resultStatus === 'validated'))
+  const failedResult = resultStatus === 'failed' || (!!resultStatus && summaryUsable === false)
   const failedProcessing = error && hasDoc && !resultStatus && !busy
   const analyzing = busy && hasDoc
 
   const documentState: NodeState = hasDoc ? 'completed' : 'idle'
   const analysisState: NodeState = !hasDoc
     ? 'idle'
-    : summarized || failedResult
+    : summarized
       ? 'completed'
-      : failedProcessing
+      : failedResult || failedProcessing
         ? 'failed'
         : analyzing
           ? 'processing'

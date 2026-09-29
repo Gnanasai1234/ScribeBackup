@@ -23,12 +23,12 @@ class DocumentSearchTests(unittest.TestCase):
         self.addCleanup(main.app.dependency_overrides.clear)
 
     def test_search_endpoint_trims_query_and_scopes_to_authenticated_user(self):
-        result = [{"id": "owned", "name": "Government Report.pdf", "language": "en", "status": "COMPLETED",
+        result = [{"id": "owned", "name": "Quarterly Report.pdf", "language": "en", "status": "COMPLETED",
                    "created_at": "2026-01-01T00:00:00+00:00", "text": "report", "chunks": [], "pages": []}]
         with patch.object(main, "search_documents_from_db", return_value=result) as search:
             response = self.client.get("/api/documents?search=%20%20GOV%20%20")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual([item["name"] for item in response.json()], ["Government Report.pdf"])
+        self.assertEqual([item["name"] for item in response.json()], ["Quarterly Report.pdf"])
         search.assert_called_once_with(self.user["id"], "GOV")
 
     def test_empty_search_uses_existing_list_route_and_search_failure_is_clear(self):

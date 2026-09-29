@@ -3,15 +3,23 @@ import { AudioLines, Cpu, Send, Sparkles } from 'lucide-react'
 import { VoiceInput, type VoiceState } from './VoiceInput'
 import { apiFetch } from '../lib/api'
 
-type Stage = 'idle' | 'voice' | 'speech-to-text' | 'transcribed' | 'llm' | 'complete'
+type Stage = 'idle' | 'voice' | 'speech-to-text' | 'transcribed' | 'llm' | 'complete' | 'failed'
+type ProviderTrace = { provider: string; status: 'success' | 'failed'; error_type?: string }
+type ProviderResult = { provider: string; model: string; fallback_used: boolean; fallback_reason?: string }
+const providers = [
+  { id: 'openai-gateway', title: 'OpenAI Gateway' },
+  { id: 'gemini', title: 'Gemini' },
+  { id: 'ollama-local', title: 'Ollama Local' },
+]
 
 const stageNames: Record<Stage, string> = {
   idle: 'Ready for a prompt',
-  voice: 'Voice · recording',
-  'speech-to-text': 'Speech-to-Text · transcribing locally',
-  transcribed: 'Transcription ready · review before sending',
-  llm: 'LLM · waiting for Ollama',
+  voice: 'Voice - recording',
+  'speech-to-text': 'Speech-to-Text - transcribing locally',
+  transcribed: 'Transcription ready - review before sending',
+  llm: 'Testing AI provider...',
   complete: 'Complete',
+  failed: 'Provider test failed',
 }
 
 export function LocalLLMTest() {
@@ -23,6 +31,8 @@ export function LocalLLMTest() {
   const [error, setError] = useState('')
   const [response, setResponse] = useState('')
   const [model, setModel] = useState('')
+  const [providerResult, setProviderResult] = useState<ProviderResult | null>(null)
+  const [providerTrace, setProviderTrace] = useState<ProviderTrace[]>([])
 
   async function sendPrompt(event: FormEvent) {
     event.preventDefault()
@@ -30,24 +40,40 @@ export function LocalLLMTest() {
     setBusy(true)
     setError('')
     setResponse('')
-    if (stage === 'transcribed') console.info('[voice] transcription submitted to Ollama prompt_characters=%d', prompt.trim().length)
+    setProviderResult(null)
+    setProviderTrace([])
+    if (stage === 'transcribed') console.info('[voice] transcription submitted to the configured LLM provider chain prompt_characters=%d', prompt.trim().length)
     setStage('llm')
     try {
-      const result = await apiFetch('/local-llm/test', {
+      const result = await apiFetch('/llm/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt: prompt.trim() }),
       })
       const body = await result.json().catch(() => ({}))
-      if (!result.ok) throw new Error(typeof body?.detail === 'string' ? body.detail : 'LLM stage failed: Ollama did not return a response.')
+      if (!result.ok) {
+        setProviderTrace(Array.isArray(body?.provider_trace) ? body.provider_trace : [])
+        setError(typeof body?.error === 'string' ? body.error : 'All configured AI providers are currently unavailable.')
+        setStage('failed')
+        return
+      }
       const text = typeof body?.response === 'string' ? body.response.trim() : ''
-      if (!text) throw new Error('LLM stage failed: Ollama returned an empty response.')
+      if (!text || typeof body?.provider !== 'string' || typeof body?.model !== 'string') throw new Error('The provider chain returned an incomplete response.')
+      const provider: ProviderResult = {
+        provider: body.provider,
+        model: body.model,
+        fallback_used: Boolean(body.fallback_used),
+        fallback_reason: typeof body.fallback_reason === 'string' ? body.fallback_reason : undefined,
+      }
+      setProviderTrace(Array.isArray(body?.provider_trace) ? body.provider_trace : [])
+      setProviderResult(provider)
       setResponse(text)
-      console.info('[llm] response received characters=%d model=%s', text.length, body?.model || 'unknown')
-      setModel(typeof body?.model === 'string' ? body.model : '')
+      const title = providers.find((item) => item.id === provider.provider)?.title || provider.provider
+      console.info('[llm] response received characters=%d provider=%s model=%s', text.length, provider.provider, provider.model)
+      setModel(`${title} - ${provider.model}`)
       setStage('complete')
     } catch (cause) {
-      setStage('llm')
+      setStage('failed')
       setError(cause instanceof Error ? cause.message : 'LLM stage failed: unable to reach the backend.')
     } finally {
       setBusy(false)
@@ -65,17 +91,17 @@ export function LocalLLMTest() {
     <div className="local-llm-page">
       <div className="page-heading">
         <div>
-          <div className="eyebrow"><span /> LOCAL MODEL WORKSPACE</div>
-          <h1>Local LLM test</h1>
-          <p>Try text or dictate a prompt. Speech is transcribed locally, then sent to your configured Ollama model.</p>
+          <div className="eyebrow"><span /> LLM PROVIDER WORKSPACE</div>
+          <h1>LLM Provider Test</h1>
+          <p>Test text or voice prompts using the same AI provider fallback chain used throughout Scribe.</p>
         </div>
       </div>
 
       <form className="local-llm-card" onSubmit={sendPrompt}>
         <div className="local-llm-title-row">
           <div className="local-llm-icon"><Cpu size={18} /></div>
-          <div><h2>Prompt</h2><p>Text and voice use the same local Ollama endpoint.</p></div>
-          <span className="local-llm-model"><span /> Ollama · {model || 'configured model'}</span>
+          <div><h2>Prompt</h2><p>Text and voice use the same centralized provider router.</p></div>
+          <span className="local-llm-model"><span /> {model || 'OpenAI Gateway -> Gemini -> Ollama Local'}</span>
         </div>
 
         <label className="local-llm-label" htmlFor="local-llm-prompt">Type a prompt or review your transcription</label>
@@ -118,11 +144,28 @@ export function LocalLLMTest() {
         <div className="local-llm-actions">
           <span className="local-llm-stage" role="status" aria-live="polite">{stageNames[stage]}</span>
           <button className="primary-btn" type="submit" disabled={busy || !prompt.trim()}>
-            {busy ? <><span className="spinner" /> Running locally…</> : <><Send size={14} /> Send to Ollama</>}
+            {busy ? <><span className="spinner" /> Testing AI provider...</> : <><Send size={14} /> Send prompt</>}
           </button>
         </div>
         {error && <div className="local-llm-error" role="alert"><b>{stage === 'voice' ? 'Voice' : stage === 'speech-to-text' ? 'Speech-to-Text' : 'LLM'} stage failed</b><span>{error}</span></div>}
-        {response && <section className="local-llm-response" aria-live="polite"><div><span className="hero-kicker"><Sparkles size={13} /> LOCAL MODEL RESPONSE</span><span className="local-llm-response-model">{model}</span></div><p>{response}</p></section>}
+        {(response || providerTrace.length > 0) && <section className="local-llm-response" aria-live="polite">
+          {providerResult && <div className="local-llm-provider-meta">
+            <span><b>Provider:</b> {providers.find((item) => item.id === providerResult.provider)?.title || providerResult.provider}</span>
+            <span><b>Model:</b> {providerResult.model}</span>
+            <span><b>Fallback used:</b> {providerResult.fallback_used ? 'Yes' : 'No'}</span>
+            {providerResult.fallback_reason && <span><b>Fallback reason:</b> {providerResult.fallback_reason.replace(/_/g, ' ')}</span>}
+          </div>}
+          <div className="local-llm-provider-trace"><b>Provider chain</b>
+            {providers.map((item) => {
+              const attempt = providerTrace.find((entry) => entry.provider === item.id)
+              const status = attempt?.status || 'not-attempted'
+              const mark = status === 'success' ? 'OK' : status === 'failed' ? 'X' : '-'
+              const label = status === 'not-attempted' ? 'Not attempted' : status[0].toUpperCase() + status.slice(1)
+              return <div className={`local-llm-trace-row is-${status}`} key={item.id}><span aria-hidden="true">{mark}</span><span>{item.title}</span><small>{label}</small></div>
+            })}
+          </div>
+          {response && <><div><span className="hero-kicker"><Sparkles size={13} /> PROVIDER RESPONSE</span><span className="local-llm-response-model">{model}</span></div><p>{response}</p></>}
+        </section>}
       </form>
     </div>
   )

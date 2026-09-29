@@ -66,7 +66,7 @@ def quality_evaluation_agent(state: AnalysisState) -> AnalysisState:
     result = state["result"] or {}
     result["stats"] = result.get("stats", {}) | {"processing_time_ms": round((time.perf_counter() - state["started_at"]) * 1000, 1)}
     result["workflow"] = state["node_history"] + ["quality_evaluation"]
-    result.setdefault("evaluation", {"metrics_available": ["claim support ratio", "citation coverage", "semantic similarity"], "metrics_unavailable": ["ROUGE without a reference summary"]})
+    result.setdefault("evaluation", {"metrics_available": ["claim support ratio", "citation coverage"], "metrics_unavailable": ["semantic similarity without a configured evaluator"]})
     state["node_history"].append("quality_evaluation")
     state["result"] = result
     return state

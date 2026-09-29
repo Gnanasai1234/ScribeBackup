@@ -77,9 +77,9 @@ class LocalOllamaService:
         self.model = model
         self.base_url = _ollama_config("OLLAMA_BASE_URL", "LOCAL_LLM_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
         try:
-            self.timeout = max(2.0, min(300.0, float(_ollama_config("OLLAMA_TIMEOUT_SECONDS", "LOCAL_LLM_TIMEOUT_SECONDS", "120"))))
+            self.timeout = max(5.0, min(90.0, float(_ollama_config("OLLAMA_TIMEOUT_SECONDS", "LOCAL_LLM_TIMEOUT_SECONDS", "45"))))
         except ValueError:
-            self.timeout = 120.0
+            self.timeout = 45.0
 
     def complete(self, system: str, user: str, *, max_tokens: int = 1800, json_mode: bool | dict[str, Any] = False) -> str:
         validate_llm_input(system, user, operation=operation_for_prompt(system), content=user)
@@ -293,7 +293,7 @@ def get_local_llm_service() -> LocalOllamaService | None:
     configured = _ollama_config("OLLAMA_MODEL", "LOCAL_LLM_MODEL", "llama3.2:1b")
     base_url = _ollama_config("OLLAMA_BASE_URL", "LOCAL_LLM_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
     if not _ollama_ready(configured):
-        LOGGER.warning("Ollama fallback unavailable provider=ollama-local model=%s timeout=%ss status=model_missing_or_api_unavailable", configured, _ollama_config("OLLAMA_TIMEOUT_SECONDS", "LOCAL_LLM_TIMEOUT_SECONDS", "120"))
+        LOGGER.warning("Ollama fallback unavailable provider=ollama model=%s timeout=%ss status=model_missing_or_api_unavailable", configured, _ollama_config("OLLAMA_TIMEOUT_SECONDS", "LOCAL_LLM_TIMEOUT_SECONDS", "45"))
         return None
     if _LOCAL_LLM_SERVICE is not None and _LOCAL_LLM_SERVICE.model == configured:
         return None if time.monotonic() < _OLLAMA_FAILED_UNTIL else _LOCAL_LLM_SERVICE
