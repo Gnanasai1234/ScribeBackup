@@ -146,6 +146,15 @@ class MultilingualTtsTests(unittest.TestCase):
             self.assertEqual(data["language"], "en")
             self.assertTrue(len(data["timings"]) >= 2)
 
+    def test_tts_accepts_generated_response_text_through_existing_document_route(self):
+        generated = "Generated study response: తెలుగు · Hindi · résumé ✓"
+        res = self.client.post(
+            f"/api/documents/{self.doc_id}/audio",
+            json={"language": "en", "provider": "browser", "narration_text": generated},
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["text"], generated)
+
     def test_tts_audio_preserves_multilingual_language(self):
         # When language matches document language, narration text is preserved
         DOCS[self.doc_id]["result"]["language"] = "te"

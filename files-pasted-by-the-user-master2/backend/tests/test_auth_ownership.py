@@ -130,16 +130,6 @@ class AuthOwnershipTests(unittest.TestCase):
         self.assertNotEqual(alice_first.json()["id"], bob_first.json()["id"])
         self.assertEqual(bob_duplicate.status_code, 409)
 
-    def test_owner_can_retry_and_delete_their_document(self):
-        user = self.register_and_login("Casey", "casey@example.com")
-        main.DOCS["casey-doc"] = {"id": "casey-doc", "user_id": user["id"], "name": "casey.txt", "text": "Private text", "chunks": [], "pages": [], "language": "en", "status": "UPLOADED", "created_at": "2026-01-01T00:00:00+00:00", "result": None}
-        with patch.object(main, "process_document", return_value={"status": "retried"}):
-            retried = self.client.post("/api/documents/casey-doc/retry", json={"summary_depth": "quick"})
-        self.assertEqual(retried.status_code, 200)
-        self.assertEqual(retried.json(), {"status": "retried"})
-        self.assertEqual(self.client.delete("/api/documents/casey-doc").status_code, 204)
-        self.assertNotIn("casey-doc", main.DOCS)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, Request, Depends
 from fastapi.concurrency import run_in_threadpool
@@ -26,6 +26,11 @@ from dotenv import load_dotenv
 # Load the existing project .env before any service (including OCR) is configured.
 APP_DIR = Path(__file__).resolve().parent
 load_dotenv(APP_DIR.parent.parent / ".env")
+_log_level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+logging.basicConfig(
+    level=getattr(logging, _log_level_name, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 from database.repositories import (database_schema_status, get_document as load_document_from_db,
     list_documents as list_documents_from_db, save_document, save_question, delete_document as delete_document_from_db,
@@ -36,7 +41,8 @@ from database.repositories import (database_schema_status, get_document as load_
     save_combined_summary, get_combined_summary, get_latest_summary_evaluation)
 from .auth import router as auth_router, get_current_user
 
-from .llm_service import LLMGenerationError, LLMService, OpenAIGatewayProvider, GeminiProvider, answer_from_evidence, summarize_document, translate_for_audio
+from .llm_service import LLMGenerationError, LLMService, OpenAIProvider, OpenRouterProvider, answer_from_evidence, summarize_document, translate_for_audio
+from services.openai_config import DIRECT_OPENAI_BASE_URL, openai_key_problem
 from models.language_context import LanguageContext
 from .textmatch import term_hits, term_present
 from workflow.analysis import run_analysis_workflow
@@ -50,6 +56,7 @@ from services.tts_service import (
 from services.embedding_service import cosine_similarity, get_embedding_service
 from services.document_comparison import perform_document_comparison
 from services.local_fallbacks import get_local_llm_service
+from services.llm_logging import log_error as log_llm_error, log_success as log_llm_success
 from services.summary_evaluation import evaluate_summary
 from services.speech_to_text import (
     AudioRecordingEmpty,
@@ -108,6 +115,20 @@ async def verify_tesseract_at_startup() -> None:
 
 @asynccontextmanager
 async def app_lifespan(_: FastAPI):
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    openai_problem = openai_key_problem(openai_key)
+    configured_openai_url = os.getenv("OPENAI_BASE_URL", DIRECT_OPENAI_BASE_URL).strip().rstrip("/")
+    LOGGER.info("[CONFIG] OPENROUTER_API_KEY configured=%s", str(bool(os.getenv("OPENROUTER_API_KEY", "").strip())).lower())
+    LOGGER.info("[CONFIG] OPENROUTER_MODEL=%s", os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"))
+    LOGGER.info("[CONFIG] OPENAI_API_KEY configured=%s", str(bool(openai_key) and not openai_problem).lower())
+    LOGGER.info("[CONFIG] OPENAI_MODEL=%s", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    LOGGER.info("[CONFIG] OPENAI_BASE_URL=%s", configured_openai_url if configured_openai_url == DIRECT_OPENAI_BASE_URL else "invalid (must be official direct endpoint)")
+    LOGGER.info("[CONFIG] OLLAMA_BASE_URL=%s", os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"))
+    LOGGER.info("[CONFIG] OLLAMA_MODEL=%s", os.getenv("OLLAMA_MODEL", "llama3.2:1b"))
+    if openai_problem:
+        LOGGER.error("[CONFIG ERROR] %s", openai_problem)
+    if configured_openai_url != DIRECT_OPENAI_BASE_URL:
+        LOGGER.error("[CONFIG ERROR] OPENAI_BASE_URL must be %s; custom proxies are disabled.", DIRECT_OPENAI_BASE_URL)
     database_status = database_schema_status()
     if not database_status["connected"]:
         raise RuntimeError(
@@ -216,12 +237,33 @@ class ProcessOptions(BaseModel):
 
 
 class LocalLLMTestRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=4000)
+    prompt: str = Field(min_length=1, max_length=30000)
+    document_id: str | None = Field(default=None, max_length=80)
+    purpose: Literal["general", "study", "business", "technical", "research", "presentation", "key_findings", "custom"] = "general"
+    audience: Literal["general", "student", "developer_technical", "business_professional", "executive", "researcher", "expert"] = "general"
+    depth: Literal["quick", "standard", "deep"] = "standard"
+    translate_to: str | None = None
 
     @field_validator("prompt", mode="before")
     @classmethod
     def normalize_prompt(cls, value: Any) -> str:
         return str(value or "").strip()
+
+    @field_validator("document_id", mode="before")
+    @classmethod
+    def normalize_document_id(cls, value: Any) -> str | None:
+        document_id = str(value or "").strip()
+        return document_id or None
+
+    @field_validator("translate_to", mode="before")
+    @classmethod
+    def validate_translation_target(cls, value: Any) -> str | None:
+        target = str(value or "").strip().lower()
+        if not target:
+            return None
+        if target not in LANGUAGES:
+            raise ValueError(f"translate_to must be one of: {', '.join(sorted(LANGUAGES))}")
+        return target
 
 
 class AskRequest(BaseModel):
@@ -244,6 +286,24 @@ class AudioRequest(BaseModel):
     voice_id: str = "browser-default"
     provider: str | None = None
     rate: float = Field(default=1.0, ge=0.7, le=1.3)
+    narration_text: str | None = Field(default=None, max_length=30000)
+    narration_language: str | None = None
+
+    @field_validator("narration_text", mode="before")
+    @classmethod
+    def normalize_narration_text(cls, value: Any) -> str | None:
+        text = str(value).strip() if value is not None else ""
+        return text or None
+
+    @field_validator("narration_language", mode="before")
+    @classmethod
+    def validate_narration_language(cls, value: Any) -> str | None:
+        language = str(value or "").strip().lower()
+        if not language:
+            return None
+        if language not in LANGUAGES:
+            raise ValueError(f"narration_language must be one of: {', '.join(sorted(LANGUAGES))}")
+        return language
 
 
 class BatchProcessRequest(BaseModel):
@@ -629,7 +689,8 @@ def process_document(doc: dict[str, Any], options: ProcessOptions) -> dict[str, 
             return summary
         except Exception as exc:
             metadata = service.provider_metadata
-            LOGGER.warning("[SUMMARY] generation_failed type=%s; using extractive summary", type(exc).__name__)
+            LOGGER.warning("[SUMMARY] generation unavailable error_type=%s provider_trace=%s", type(exc).__name__, json.dumps(getattr(service, "provider_trace", []), separators=(",", ":")))
+            LOGGER.warning("[SUMMARY] Using deterministic extractive fallback")
             fallback = process_extractively(source, current_options)
             target_name = LANGUAGES.get(current_options.language, current_options.language)
             limitations = ["Configured providers could not generate a usable summary; deterministic sentence ranking produced this source-grounded extractive summary.",
@@ -640,10 +701,10 @@ def process_document(doc: dict[str, Any], options: ProcessOptions) -> dict[str, 
             fallback["provider"] = {
                 "name": "deterministic-extractive", "model": None, "fallback_used": True,
                 "fallback_reason": metadata.get("fallback_reason", type(exc).__name__),
-                "providers_attempted": ["openai-gateway", "gemini", "ollama-local"],
+                "providers_attempted": ["openrouter", "openai-direct", "ollama-local"],
             }
             fallback["generation_status"] = "partial_success" if is_usable_summary(fallback.get("executive_summary")) else "failed"
-            fallback["provider_status"] = {"primary": "Gemini failed or returned unusable output", "fallback": "Ollama Local failed or was unavailable", "final": "deterministic extractive summary"}
+            fallback["provider_status"] = {"primary": "OpenRouter failed or returned unusable output", "fallback": "OpenAI and Ollama Local failed or were unavailable", "final": "deterministic extractive summary"}
             return fallback
 
     result = run_analysis_workflow(doc, resolved_options, summarize)
@@ -666,7 +727,7 @@ def process_document(doc: dict[str, Any], options: ProcessOptions) -> dict[str, 
             ]
             result["provider"] = {"name": "deterministic-extractive", "model": None, "fallback_used": True,
                                    "fallback_reason": "all_configured_providers_failed",
-                                   "providers_attempted": ["openai-gateway", "gemini", "ollama-local"],
+                                   "providers_attempted": ["openrouter", "openai-direct", "ollama-local"],
                                    "primary_provider": primary_name, "primary_model": primary_model}
             result["provider_status"] = {"primary": f"{primary_name} RETURNED NO USABLE SUMMARY", "final": "DETERMINISTIC EXTRACTIVE SUMMARY"}
             result["generation_status"] = "partial_success"
@@ -679,7 +740,7 @@ def process_document(doc: dict[str, Any], options: ProcessOptions) -> dict[str, 
             result["summary"] = None
             result["error"] = "No usable summary could be generated from the extracted document text."
             result["provider"] = {"name": "none", "model": None, "fallback_used": True}
-            LOGGER.error("[SUMMARY] document_id=%s fallback_completed text_length=0 generation_failed", doc.get("id", "unknown"))
+            LOGGER.error("[SUMMARY] no deterministic fallback was usable document_id=%s provider_trace=%s", doc.get("id", "unknown"), json.dumps(getattr(service, "provider_trace", []), separators=(",", ":")))
     else:
         result["executive_summary"] = generated_summary
         provider_info = result.get("provider") if isinstance(result.get("provider"), dict) else {}
@@ -766,21 +827,26 @@ def health():
     local_llm = get_local_llm_service()
     embedding_svc = get_embedding_service()
     emb_info = embedding_svc.get_info()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    openai_base_url = os.getenv("OPENAI_BASE_URL", DIRECT_OPENAI_BASE_URL).strip().rstrip("/")
+    direct_openai_configured = bool(openai_key) and openai_key_problem(openai_key) is None and openai_base_url == DIRECT_OPENAI_BASE_URL
     return {
         "status": "ok" if database_status["schema_ready"] else "degraded",
-        "mode": "openai-gateway" if (os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENAI_GATEWAY_API_KEY", "")).strip() else ("gemini" if os.getenv("GEMINI_API_KEY", "").strip() else ("ollama-local" if local_llm else "unavailable")),
+        "mode": "openrouter" if os.getenv("OPENROUTER_API_KEY", "").strip() else ("openai-direct" if direct_openai_configured else ("ollama-local" if local_llm else "unavailable")),
         "llm": {
-            "primary_provider": "openai-gateway",
-            "primary_url": os.getenv("OPENAI_GATEWAY_URL", "https://keygateway1.arshnivlabs.com/v1").strip(),
-            "primary_model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            "primary_configured": bool((os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENAI_GATEWAY_API_KEY", "")).strip()),
-            "secondary_provider": "gemini",
-            "secondary_model": os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
-            "secondary_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
+            "primary_provider": "openrouter",
+            "primary_url": "https://openrouter.ai/api/v1",
+            "primary_model": os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+            "primary_configured": bool(os.getenv("OPENROUTER_API_KEY", "").strip()),
+            "secondary_provider": "openai-direct",
+            "secondary_url": DIRECT_OPENAI_BASE_URL,
+            "secondary_model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            "secondary_configured": direct_openai_configured,
+            "secondary_configuration_error": (openai_key_problem(openai_key) or ("OPENAI_BASE_URL must be https://api.openai.com/v1. Custom OpenAI proxies are not supported." if openai_base_url != DIRECT_OPENAI_BASE_URL else None)),
             "fallback_provider": "ollama-local",
-            "fallback_model": local_llm.model if local_llm else os.getenv("OLLAMA_MODEL", "llama3.2"),
+            "fallback_model": local_llm.model if local_llm else os.getenv("OLLAMA_MODEL", "llama3.2:1b"),
             "fallback_available": local_llm is not None,
-            "priority": ["openai-gateway", "gemini", "ollama-local"],
+        "priority": ["openrouter", "openai-direct", "ollama-local"],
         },
         "database": database_status,
         "embedding": emb_info,
@@ -839,15 +905,21 @@ async def voice_transcribe(
         return {"text": transcript, "language": str(local_result.get("language") or language), "provider": "faster-whisper-local"}
 
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not openai_key:
-        return await use_local_stt("external_credential_missing")
+    key_problem = openai_key_problem(openai_key)
+    if key_problem:
+        return await use_local_stt("external_credential_missing_or_invalid")
 
     # A configured but invalid/unreachable paid provider must not prevent local STT.
     try:
         import io
         from openai import OpenAI as OpenAIClient
 
-        client = OpenAIClient(api_key=openai_key)
+        client = OpenAIClient(
+            api_key=openai_key,
+            base_url=DIRECT_OPENAI_BASE_URL,
+            timeout=float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30")),
+            max_retries=0,
+        )
         filename = audio.filename or f"recording.{_audio_extension(audio.content_type or '')}"
         audio_file = io.BytesIO(audio_bytes)
         audio_file.name = filename
@@ -1052,29 +1124,100 @@ def list_documents(search: str = "", current_user: dict[str, Any] = Depends(get_
     return [public_doc(d) for d in documents]
 
 
+def _build_llm_test_system_prompt(payload: LocalLLMTestRequest) -> str:
+    purpose_guidance = {
+        "general": "Provide a clear, balanced general summary or answer.",
+        "study": "Focus on concepts, definitions, important points, examples, and learning-oriented explanations.",
+        "business": "Focus on decisions, outcomes, risks, metrics, actions, and business impact.",
+        "technical": "Focus on architecture, implementation details, technologies, processes, dependencies, and technical findings.",
+        "research": "Focus on methodology, findings, evidence, limitations, and conclusions.",
+        "presentation": "Organize the key message and supporting points for a clear presentation.",
+        "key_findings": "Prioritize the most important findings and their supporting evidence.",
+        "custom": "Follow the user's stated purpose and requested output closely.",
+    }
+    audience_guidance = {
+        "general": "Use clear language suitable for a broad audience.",
+        "student": "Explain concepts clearly and avoid unnecessary jargon.",
+        "developer_technical": "Use appropriate technical terminology and implementation details.",
+        "business_professional": "Emphasize practical implications, trade-offs, and actions.",
+        "executive": "Be concise and focus on decisions, impact, risks, and recommendations.",
+        "researcher": "Preserve methodological nuance, evidence, and limitations.",
+        "expert": "Allow technical and domain-specific detail without oversimplifying.",
+    }
+    depth_guidance = {
+        "quick": "Give a short overview with only the most important points.",
+        "standard": "Give a balanced response covering the main information.",
+        "deep": "Give a detailed response covering important context, evidence, relationships, and supporting details.",
+    }
+    return "\n".join((
+        "Answer the user's prompt clearly. If asked to summarize, summarize only supplied text and do not invent facts.",
+        f"Purpose ({payload.purpose}): {purpose_guidance[payload.purpose]}",
+        f"Audience ({payload.audience}): {audience_guidance[payload.audience]}",
+        f"Depth ({payload.depth}): {depth_guidance[payload.depth]}",
+    ))
+
+
 @app.post("/api/llm/test")
 @app.post("/api/local-llm/test", include_in_schema=False)
 def local_llm_test(payload: LocalLLMTestRequest, current_user: dict[str, Any] = Depends(get_current_user)):
     """Run a real prompt through the same authenticated centralized provider chain."""
     LOGGER.info("[LLM TEST] request_started user_id=%s", current_user.get("id", "authenticated"))
+    if payload.document_id:
+        get_doc(payload.document_id, current_user)
     service = LLMService()
+    system_prompt = _build_llm_test_system_prompt(payload)
     try:
-        response_text = service.complete(
-            "Answer the user's prompt clearly and concisely. If asked to summarize, summarize only the supplied text and do not invent facts.",
-            payload.prompt,
-            max_tokens=800,
-        )
+        if payload.translate_to:
+            response_text = translate_for_audio(payload.prompt, payload.translate_to, service)
+        else:
+            response_text = service.complete(
+                system_prompt,
+                payload.prompt,
+                max_tokens={"quick": 400, "standard": 800, "deep": 1400}[payload.depth],
+            )
     except Exception as exc:
-        LOGGER.warning("[LLM TEST] request_failed error_type=%s", type(exc).__name__)
+        LOGGER.warning("[LLM TEST] request_failed error_type=%s provider_trace=%s", type(exc).__name__, json.dumps(getattr(service, "provider_trace", []), separators=(",", ":")))
         return JSONResponse(status_code=502, content={
             "success": False,
             "error": "All configured AI providers are currently unavailable.",
             "provider_trace": service.provider_trace,
         })
     metadata = service.provider_metadata
+    try:
+        history_id = record_history(
+            user_id=int(current_user["id"]),
+            document_id=payload.document_id,
+            activity_type="llm_test",
+            title=(f"Translated {payload.purpose.replace('_', ' ').title()} prompt response"
+                   if payload.translate_to else f"{payload.purpose.replace('_', ' ').title()} prompt response"),
+            status="completed",
+            input_text=payload.prompt,
+            output_text=response_text,
+            provider=metadata.get("name"),
+            model=metadata.get("model"),
+            extra_data={
+                "purpose": payload.purpose,
+                "audience": payload.audience,
+                "depth": payload.depth,
+                "translation_language": payload.translate_to,
+                "fallback_used": bool(metadata.get("fallback_used")),
+                "fallback_reason": metadata.get("fallback_reason"),
+            },
+        )
+    except Exception as exc:
+        history_id = None
+        LOGGER.warning("[LLM TEST] history_save_failed error_type=%s", type(exc).__name__)
     return {
         "success": True,
         "response": response_text,
+        "generation_settings": {
+            "purpose": payload.purpose,
+            "audience": payload.audience,
+            "depth": payload.depth,
+        },
+        "history_id": history_id,
+        "history_persisted": history_id is not None,
+        "translation_language": payload.translate_to,
         "provider": metadata.get("name"),
         "model": metadata.get("model"),
         "fallback_used": bool(metadata.get("fallback_used")),
@@ -1089,21 +1232,36 @@ def llm_provider_diagnostics(current_user: dict[str, Any] = Depends(get_current_
     """Explicitly probe each configured provider separately; startup generates no test traffic."""
     probe_system = "Return exactly the requested diagnostic token and nothing else."
     results: list[dict[str, Any]] = []
-    for provider in (OpenAIGatewayProvider(), GeminiProvider()):
+    for provider in (OpenRouterProvider(), OpenAIProvider()):
         name = provider.provider_name
-        is_gemini = name == "gemini"
         entry = {"provider": name, "model": provider.model,
-                 "endpoint": "https://generativelanguage.googleapis.com" if is_gemini else provider.base_url,
+                 "endpoint": provider.base_url, "base_url": provider.base_url,
                  "api_key_present": bool(provider.api_key), "request_started": False,
-                 "configured": bool(provider.client), "available": False,
+                 "configured": bool(provider.client), "reachable": False, "model_valid": False, "available": False,
                  "request_success": False, "response_non_empty": False}
+        if name == "openai-direct":
+            entry["credential_valid"] = not bool(provider.config_error)
+            if provider.config_error:
+                entry["configuration_error"] = provider.config_error
         if provider.client:
+            probe_started = time.monotonic()
             try:
                 entry["request_started"] = True
-                response_text = provider.complete(probe_system, "Return the word OK", max_tokens=12)
+                token = "OPENROUTER_TEST_OK" if name == "openrouter" else "OPENAI_DIRECT_TEST_OK"
+                response_text = provider.complete(probe_system, f"Reply with exactly: {token}", max_tokens=12)
                 entry["response_non_empty"] = bool(response_text and response_text.strip())
-                entry["request_success"] = entry["response_non_empty"]
+                entry["response"] = response_text
+                entry["token_matched"] = token in response_text
+                entry["reachable"] = True
+                entry["model_valid"] = entry["token_matched"]
+                entry["request_success"] = entry["response_non_empty"] and entry["token_matched"]
                 entry["available"] = entry["request_success"]
+                if entry["request_success"]:
+                    log_llm_success(name, provider.model, 200, time.monotonic() - probe_started, response_text)
+                else:
+                    error = ValueError("Diagnostic response did not match the expected token")
+                    log_llm_error(name, provider.model, provider.base_url, provider.timeout, error,
+                                  time.monotonic() - probe_started, status=200, category="ResponseValidationError")
             except Exception as exc:
                 entry["error_type"] = _diagnostic_error_type(exc)
                 entry["http_status"] = getattr(exc, "status_code", None) or getattr(exc, "code", None)
@@ -1112,21 +1270,34 @@ def llm_provider_diagnostics(current_user: dict[str, Any] = Depends(get_current_
             entry["error_type"] = "SDKCompatibilityError"
             entry["error_message"] = "Provider SDK could not be initialized."
         else:
-            entry["error_type"] = "MissingAPIKey"
-            entry["error_message"] = f"{('GEMINI_API_KEY' if is_gemini else 'OPENAI_API_KEY')} is missing or empty; no request was sent."
+            if name == "openai-direct" and getattr(provider, "config_error", None):
+                entry["error_type"] = "InvalidConfiguration"
+                entry["error_message"] = provider.config_error
+            else:
+                entry["error_type"] = "MissingAPIKey"
+                key_name = "OPENROUTER_API_KEY" if name == "openrouter" else "OPENAI_API_KEY"
+                entry["error_message"] = f"{key_name} is missing or empty; no request was sent."
         results.append(entry)
     local = get_local_llm_service()
-    probe_prompt = "OK"
     entry = {"provider": "ollama-local", "model": os.getenv("OLLAMA_MODEL", "llama3.2:1b"),
              "endpoint": os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
-             "configured": local is not None, "available": False}
+             "configured": local is not None, "reachable": False, "model_installed": local is not None, "available": False}
     if local is not None:
         entry["model"] = local.model
+        probe_started = time.monotonic()
         try:
-            entry["response"] = local.complete(probe_system, probe_prompt, max_tokens=4)
-            entry["response_non_empty"] = bool(entry["response"] and entry["response"].strip())
-            entry["request_success"] = entry["response_non_empty"]
+            response_text = local.complete(probe_system, "Reply with exactly: OLLAMA_TEST_OK", max_tokens=12)
+            entry["response_non_empty"] = bool(response_text and response_text.strip())
+            entry["token_matched"] = "OLLAMA_TEST_OK" in response_text
+            entry["reachable"] = True
+            entry["request_success"] = entry["response_non_empty"] and entry["token_matched"]
             entry["available"] = entry["request_success"]
+            if entry["request_success"]:
+                log_llm_success("ollama-local", local.model, 200, time.monotonic() - probe_started, response_text)
+            else:
+                error = ValueError("Diagnostic response did not match the expected token")
+                log_llm_error("ollama-local", local.model, entry["endpoint"], getattr(local, "timeout", 0),
+                              error, time.monotonic() - probe_started, status=200, category="ResponseValidationError")
         except Exception as exc:
             entry["error_type"] = type(exc).__name__
             entry["error_message"] = _safe_diagnostic_message(exc)
@@ -1134,7 +1305,7 @@ def llm_provider_diagnostics(current_user: dict[str, Any] = Depends(get_current_
         entry["error_type"] = "ConfigurationError"
         entry["error_message"] = "Ollama endpoint is unavailable or the configured model is not installed."
     results.append(entry)
-    return {"priority": ["openai-gateway", "gemini", "ollama-local"], "providers": results}
+    return {"priority": ["openrouter", "openai-direct", "ollama-local"], "providers": results}
 
 
 def _safe_diagnostic_message(exc: Exception) -> str:
@@ -1527,7 +1698,7 @@ def ask(doc_id: str, payload: AskRequest, current_user: dict[str, Any] = Depends
     try:
         answer = answer_from_evidence(payload.question, evidence, service, output_language=output_lang)
     except LLMGenerationError as exc:
-        LOGGER.warning("Grounded Q&A generation unavailable type=%s", type(exc).__name__)
+        LOGGER.warning("Grounded Q&A generation unavailable type=%s provider_trace=%s", type(exc).__name__, json.dumps(getattr(service, "provider_trace", []), separators=(",", ":")))
         raise HTTPException(503, "Configured providers could not generate a grounded answer.") from exc
     mode_desc = "Answer grounded in hybrid semantic/lexical evidence" if semantic_used else "Answer grounded in lexical evidence"
     provider = service.provider_metadata
@@ -1642,8 +1813,9 @@ def audio(doc_id: str, payload: AudioRequest, current_user: dict[str, Any] = Dep
         raise HTTPException(422, f"Audio language '{payload.language}' is not supported. Supported languages: {', '.join(sorted(LANGUAGES.keys()))}.")
 
     # Preserve user's requested language throughout
-    narration_text = result["executive_summary"]
-    if payload.language != result.get("language"):
+    narration_text = payload.narration_text or result["executive_summary"]
+    narration_language = payload.narration_language or result.get("language")
+    if payload.language != narration_language:
         translation_service = LLMService()
         try:
             translated_text = translate_for_audio(narration_text, payload.language, translation_service)

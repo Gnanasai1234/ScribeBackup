@@ -1,6 +1,6 @@
 # Scribe — Document Intelligence MVP
 
-Scribe is a document intelligence prototype that uses a centralized provider chain: Gemini, then an installed local Ollama model. Local extractive summarization and lexical evidence retrieval remain available as final fallbacks. Speech transcription can use hosted Whisper when configured and automatically falls back to local Faster Whisper.
+Scribe is a document intelligence prototype that uses a centralized provider chain: OpenRouter, Direct OpenAI, then an installed local Ollama model. Deterministic extractive processing is available as the final summary fallback. Speech transcription can use hosted Whisper when configured and automatically falls back to local Faster Whisper.
 
 ## What works
 
@@ -9,7 +9,7 @@ Scribe is a document intelligence prototype that uses a centralized provider cha
 - Quick, Standard, Deep, Auto, and Custom summary settings. The modes change context coverage, map-note detail, output structure, claim limits, and synthesis token budgets.
 - Structured summary fields, claim-level validation against cited source chunks, and up to two regeneration attempts.
 - Evidence retrieval followed by an LLM-generated Q&A response constrained to retrieved source passages, using the centralized provider chain.
-- Deterministic extractive summaries remain available when Gemini and Ollama are unavailable.
+- Deterministic extractive summaries remain available when OpenRouter, the API Gateway, and Ollama are unavailable.
 - Exact sentence additions/removals for document comparison.
 - Telugu, Hindi, and Tamil translation through the configured LLM when requested. Translated claims are checked against the original-language report again.
 - Language-matched speech from validated summaries: local system voices when available, with downloadable online neural MP3 playback for English, Hindi, Telugu, and Tamil.
@@ -18,7 +18,7 @@ Scribe is a document intelligence prototype that uses a centralized provider cha
 
 ## Current limits
 
-This is a runnable MVP, not the entire requested production platform. The general-purpose LLM chain is OpenAI Gateway -> Gemini -> Ollama Local. Scribe has email/password accounts and signed cookie sessions, with each document assigned to its uploader. Embeddings, a vector database, a background queue, and persistent generated audio files are not connected. Document and analysis persistence uses MySQL configured through `DATABASE_URL`; see [docs/database.md](docs/database.md). OCR uses free local Tesseract and continues with any normally extracted text when OCR is unavailable. Speech can use local system voices or the optional Edge neural TTS service; online voice generation sends only the validated summary text to Microsoft for synthesis. Claim validation uses the same centralized provider service, so treat it as an automated check rather than independent human verification.
+This is a runnable MVP, not the entire requested production platform. The general-purpose LLM chain is OpenRouter -> API Gateway -> Ollama Local. Scribe has email/password accounts and signed cookie sessions, with each document assigned to its uploader. Embeddings, a vector database, a background queue, and persistent generated audio files are not connected. Document and analysis persistence uses MySQL configured through `DATABASE_URL`; see [docs/database.md](docs/database.md). OCR uses free local Tesseract and continues with any normally extracted text when OCR is unavailable. Speech can use local system voices or the optional Edge neural TTS service; online voice generation sends only the validated summary text to Microsoft for synthesis. Claim validation uses the same centralized provider service, so treat it as an automated check rather than independent human verification.
 
 ## Requirements
 
@@ -45,7 +45,7 @@ npm install
 npm run dev
 ```
 
-Before starting the backend, set `SESSION_SECRET` to a random value of at least 32 characters in `.env`, and configure your existing `DATABASE_URL`. Generate a secret in PowerShell with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Hosted LLM and Whisper API keys are optional. Set `OPENAI_GATEWAY_URL` and `OPENAI_API_KEY` for the primary provider, `GEMINI_API_KEY` / `GEMINI_MODEL` for the secondary provider, and an already-installed model selected by `OLLAMA_MODEL` (defaults to `llama3.2:1b`) at `OLLAMA_BASE_URL` (defaults to `http://127.0.0.1:11434`). Make sure Ollama is running and the model has already been pulled. Speech transcription uses the already-cached Faster Whisper model selected by `LOCAL_STT_MODEL` (defaults to `base`); it does not download a model during a request. Provider selection and fallback are logged by the backend.
+Before starting the backend, set `SESSION_SECRET` to a random value of at least 32 characters in `.env`, and configure your existing `DATABASE_URL`. Generate a secret in PowerShell with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Hosted LLM and Whisper API keys are optional. Set `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` for the primary provider. Direct OpenAI uses `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL=https://api.openai.com/v1`, and `OPENAI_TIMEOUT_SECONDS`; custom proxies are rejected. An already-installed model selected by `OLLAMA_MODEL` (defaults to `llama3.2:1b`) runs at `OLLAMA_BASE_URL` (defaults to `http://127.0.0.1:11434`). Make sure Ollama is running and the model has already been pulled. Speech transcription uses the already-cached Faster Whisper model selected by `LOCAL_STT_MODEL` (defaults to `base`); it does not download a model during a request. Provider selection and fallback are logged by the backend.
 
 Apply database changes from the backend directory with `alembic upgrade head`. The migrations add `users`, a nullable `documents.user_id`, and per-user upload/text hash indexes for duplicate detection; existing documents stay unassigned until you choose them. To assign selected legacy rows to an account, first create that account through Register, then run a deliberate MySQL update, replacing the email and IDs with your choices:
 
@@ -56,14 +56,11 @@ WHERE id IN ('document-id-one', 'document-id-two')
   AND user_id IS NULL;
 ```
 
-```powershell
-Copy-Item .env.example .env
-notepad .env
-```
+Edit the existing project `.env` file directly; it contains the runtime settings and secrets for this checkout.
 
-Document text and retrieved passages are sent first to the configured Gemini provider, then to Ollama only when Gemini fails. The provider that actually generated the response is recorded in the result. Review provider data handling settings before processing sensitive files.
+Document text and retrieved passages are sent first to OpenRouter, then the API Gateway, then Ollama only if earlier providers fail. The provider that actually generated the response is recorded in the result. Review provider data handling settings before processing sensitive files.
 
-Open `http://localhost:5173` so the frontend and API use the same site for the session cookie. API docs are at `http://localhost:8000/docs`. The demo button loads a fictional transit review and processes it through the configured OpenAI Gateway -> Gemini -> Ollama generation flow.
+Open `http://localhost:5173` so the frontend and API use the same site for the session cookie. API docs are at `http://localhost:8000/docs`. The demo button loads a fictional transit review and processes it through the configured OpenRouter -> API Gateway -> Ollama generation flow.
 
 
 ## Local OCR setup (Windows)
@@ -119,7 +116,7 @@ OCR text is merged into the document's normal page text before chunking, summari
 
 ## Environment
 
-Keep `.env` on the backend and never place provider keys in frontend configuration. Configure `OPENAI_GATEWAY_URL`, `OPENAI_API_KEY`, and optionally `OPENAI_MODEL`; configure `GEMINI_API_KEY`, `GEMINI_MODEL`, and `GEMINI_TIMEOUT_SECONDS`; configure `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_TIMEOUT_SECONDS`. Groq remains limited to embeddings. `SUMMARY_MAX_REGENERATION_ATTEMPTS` sets the retry limit. `EMBEDDING_PROVIDER` and `VECTOR_DB_URL` are currently configuration placeholders and do not activate vector retrieval.
+Keep `.env` on the backend and never place provider keys in frontend configuration. Configure `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, and optionally `OPENROUTER_TIMEOUT_SECONDS`; configure Direct OpenAI with `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL=https://api.openai.com/v1`, and `OPENAI_TIMEOUT_SECONDS`; configure Ollama with `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_TIMEOUT_SECONDS`. Groq remains limited to embeddings. `SUMMARY_MAX_REGENERATION_ATTEMPTS` sets the retry limit. `EMBEDDING_PROVIDER` and `VECTOR_DB_URL` are currently configuration placeholders and do not activate vector retrieval.
 
 Voice prompts use `LOCAL_STT_MODEL` (defaults to `base`) through Faster Whisper on the backend CPU. The selected model must already be present in the local Hugging Face cache; transcription runs with offline-only model loading and does not call a paid speech API. `LOCAL_STT_DEVICE` and `LOCAL_STT_COMPUTE_TYPE` can override the default `cpu` and `int8` settings.
 

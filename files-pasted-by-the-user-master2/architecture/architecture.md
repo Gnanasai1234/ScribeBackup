@@ -5,16 +5,17 @@ flowchart TD
   U[Upload / demo] --> X[Text extraction and OCR]
   X --> C[Chunking and document analysis]
   C --> G[Shared LLM service]
-  G --> O[OpenAI Gateway primary]
-  O -->|failure| M[Gemini fallback]
-  M -->|failure| L[Ollama Local final fallback]
+  G --> O[OpenRouter primary]
+  O -->|failure| A[API Gateway secondary /v1]
+  A -->|failure| L[Ollama Local final fallback]
   G --> V[Claim validation and translation]
   V --> S[Persisted summary and actual provider metadata]
   Q[Question] --> R[Lexical / embedding retrieval]
   R --> E[Retrieved evidence]
   E --> G
-  G --> A[Grounded answer or controlled failure]
-  R --> H[Embedding service: Groq / Gateway / local]
+  G --> Z[Grounded answer or controlled failure]
+  R --> H[Embedding service: separate from generation]
+  L -->|all generation providers fail| D[Summary: deterministic extractive fallback]
 ```
 
-All general-purpose generative operations use `backend/app/llm_service.py` and the strict OpenAI Gateway -> Gemini -> Ollama Local provider chain. The embedding subsystem is separate and may use its own configured services. Speech-to-text is a separate specialized service. Summary generation retains a deterministic extractive fallback after all three providers fail, while RAG does not expose retrieved excerpts as an answer when generation fails.
+All general-purpose generation uses `backend/app/llm_service.py` and the strict OpenRouter ? API Gateway ? Ollama Local chain. The embedding subsystem is separate. Speech-to-text is a specialized service. Summary generation retains the deterministic extractive fallback after all three LLM providers fail, while RAG returns a controlled failure instead of presenting retrieved excerpts as an answer.

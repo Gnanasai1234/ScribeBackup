@@ -63,7 +63,7 @@ class TranslationPipelineTests(unittest.TestCase):
         }
 
         mock_service = MagicMock(spec=LLMService)
-        mock_service.provider_name = "openai-gateway"
+        mock_service.provider_name = "openai"
         mock_service.model = "gpt-4o-mini"
 
         # Mock complete_json responses:
@@ -135,7 +135,7 @@ class TranslationPipelineTests(unittest.TestCase):
         }
 
         mock_service = MagicMock(spec=LLMService)
-        mock_service.provider_name = "openai-gateway"
+        mock_service.provider_name = "openai"
         mock_service.model = "gpt-4o-mini"
 
         def mock_complete_json(system, user, max_tokens=1800, **kwargs):
@@ -201,7 +201,7 @@ class TranslationPipelineTests(unittest.TestCase):
     def test_direct_target_generation_uses_target_language_before_translation(self):
         doc = {"id": "doc_direct", "text": self.english_sentence, "chunks": make_chunks(self.english_sentence, []), "pages": [], "language": "en"}
         service = MagicMock(spec=LLMService)
-        service.provider_name = "openai-gateway"
+        service.provider_name = "openai"
         service.model = "mock"
         target_claim = self.telugu_sentence
 
@@ -227,7 +227,7 @@ class TranslationPipelineTests(unittest.TestCase):
     def test_regeneration_keeps_direct_target_language(self):
         doc = {"id": "doc_direct_revision", "text": self.english_sentence, "chunks": make_chunks(self.english_sentence, []), "pages": [], "language": "en"}
         service = MagicMock(spec=LLMService)
-        service.provider_name = "openai-gateway"
+        service.provider_name = "openai"
         service.model = "mock"
         validation_calls = 0
 
@@ -267,7 +267,7 @@ class TranslationPipelineTests(unittest.TestCase):
             with self.subTest(source=source_lang, target=target_lang):
                 doc = {"id": f"doc_{source_lang}_{target_lang}", "text": source_text, "chunks": make_chunks(source_text, []), "pages": [], "language": source_lang}
                 service = MagicMock(spec=LLMService)
-                service.provider_name = "openai-gateway"
+                service.provider_name = "openai"
                 service.model = "mock"
 
                 def complete_json(system, user, max_tokens=1800, **kwargs):
@@ -293,7 +293,7 @@ class TranslationPipelineTests(unittest.TestCase):
     def test_translation_validation_failure_falls_back_without_regeneration(self):
         doc = {"id": "doc_mismatch", "text": self.telugu_text, "chunks": make_chunks(self.telugu_text, []), "pages": [], "language": "te"}
         service = MagicMock(spec=LLMService)
-        service.provider_name = "openai-gateway"
+        service.provider_name = "openai"
         service.model = "mock"
         validation_calls = 0
 
@@ -324,7 +324,7 @@ class TranslationPipelineTests(unittest.TestCase):
     def test_validation_provider_failure_retries_three_times_and_keeps_summary(self):
         doc = {"id": "doc_validation_unavailable", "text": self.english_sentence, "chunks": make_chunks(self.english_sentence, []), "pages": [], "language": "en"}
         service = MagicMock(spec=LLMService)
-        service.provider_name = "openai-gateway"
+        service.provider_name = "openai"
         service.model = "mock"
 
         def complete_json(system, user, max_tokens=1800, **kwargs):
@@ -349,7 +349,7 @@ class TranslationPipelineTests(unittest.TestCase):
     def test_validation_stops_after_three_attempts_and_returns_latest_summary(self):
         doc = {"id": "doc_validation_partial", "text": self.english_sentence, "chunks": make_chunks(self.english_sentence, []), "pages": [], "language": "en"}
         service = MagicMock(spec=LLMService)
-        service.provider_name = "openai-gateway"
+        service.provider_name = "openai"
         service.model = "mock"
         validation_calls = 0
         regenerations = 0
@@ -385,7 +385,7 @@ class TranslationPipelineTests(unittest.TestCase):
     def test_zero_claims_is_distinct_from_validation_unavailable(self):
         doc = {"id": "doc_no_claims", "text": self.english_sentence, "chunks": make_chunks(self.english_sentence, []), "pages": [], "language": "en"}
         service = MagicMock(spec=LLMService)
-        service.provider_name = "openai-gateway"
+        service.provider_name = "openai"
         service.model = "mock"
         validation_calls = 0
 
@@ -419,7 +419,7 @@ class TranslationPipelineTests(unittest.TestCase):
         }
 
         mock_service = MagicMock(spec=LLMService)
-        mock_service.provider_name = "openai-gateway"
+        mock_service.provider_name = "openai"
         mock_service.model = "gpt-4o-mini"
 
         # Model erroneously returns Telugu text for a Kannada translation request
@@ -493,7 +493,7 @@ class TranslationPipelineTests(unittest.TestCase):
     def test_translate_for_audio_strictly_checks_script(self):
         """translate_for_audio must strictly verify the output script and reject wrong language output."""
         mock_service = MagicMock(spec=LLMService)
-        mock_service.provider_name = "openai-gateway"
+        mock_service.provider_name = "openai"
         mock_service.complete.return_value = self.kannada_sentence
 
         # Kannada translation returns Kannada script
@@ -510,7 +510,7 @@ class TranslationPipelineTests(unittest.TestCase):
     def test_translation_failure_preserves_source_language_with_single_service_interface(self):
         doc = {"id": "doc_local_te_hi", "text": self.telugu_text, "chunks": make_chunks(self.telugu_text, []), "pages": [], "language": "te"}
         primary = MagicMock(spec=LLMService)
-        primary.provider_name = "openai-gateway"
+        primary.provider_name = "openai"
         primary.model = "mock"
 
         def primary_json(system, user, max_tokens=1800, **kwargs):

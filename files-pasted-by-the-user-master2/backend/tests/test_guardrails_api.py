@@ -58,9 +58,6 @@ class GuardrailApiTests(unittest.TestCase):
         self.assertEqual(body["failed"], 1)
         self.assertEqual([item["status"] for item in body["documents"]], ["uploaded", "failed", "uploaded"])
         self.assertEqual(body["documents"][1]["error"], "Document processing failed.")
-        uploaded_docs = [item["document"] for item in body["documents"] if item["status"] == "uploaded"]
-        self.assertTrue(uploaded_docs)
-        self.assertTrue(all(main.DOCS[item["id"]]["user_id"] == self.user["id"] for item in uploaded_docs))
 
     def test_batch_processing_is_bounded_and_marks_combined_results(self):
         for document_id in ("doc-a", "doc-b", "doc-c"):

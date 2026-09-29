@@ -40,7 +40,7 @@ class PipelineTests(unittest.TestCase):
     def test_process_claims_are_source_linked_and_validated(self):
         text = "The board approved a two-year service pilot. The pilot will be reviewed every quarter."
         doc = {"text": text, "chunks": make_chunks(text, []), "pages": [], "language": "en"}
-        service = type("Service", (), {"provider_metadata": {"name": None, "model": None, "fallback_used": True}, "provider_name": "openai-gateway", "model": "gpt-4o-mini"})()
+        service = type("Service", (), {"provider_metadata": {"name": None, "model": None, "fallback_used": True}, "provider_name": "openai", "model": "gpt-4o-mini"})()
         with patch("app.main.LLMService", return_value=service), patch("app.main.summarize_document", side_effect=RuntimeError("Deterministic unit test")):
             result = process_document(doc, ProcessOptions(depth="quick"))
         self.assertEqual(result["status"], "validated")
@@ -59,7 +59,7 @@ class PipelineTests(unittest.TestCase):
     def test_backend_state_keeps_depth_purpose_audience_and_requested_language(self):
         text = "The agency identified a substantial cybersecurity risk requiring mitigation before deployment."
         doc = {"text": text, "chunks": make_chunks(text, []), "pages": [], "language": "en"}
-        service = type("Service", (), {"provider_metadata": {"name": None, "model": None, "fallback_used": True}, "provider_name": "openai-gateway", "model": "gpt-4o-mini"})()
+        service = type("Service", (), {"provider_metadata": {"name": None, "model": None, "fallback_used": True}, "provider_name": "openai", "model": "gpt-4o-mini"})()
         with unittest.mock.patch("app.main.LLMService", return_value=service), unittest.mock.patch("app.main.summarize_document", side_effect=RuntimeError("No configured provider")):
             result = process_document(doc, ProcessOptions(summary_depth="deep", purpose="Risk analysis", audience="Technical audience", language="te"))
         self.assertEqual(result["summary_mode"], "deep")

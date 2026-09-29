@@ -6,9 +6,11 @@ import logging
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from typing import Any
 from .guardrails import config_int, llm_retry_limit, operation_for_prompt, validate_llm_input, validate_provider_response, validate_llm_output, validate_model_json_contract
+from .llm_logging import EmptyResponseError, error_category, log_error, log_empty, log_request, log_response
 
 LOGGER = logging.getLogger("scribe.local_fallbacks")
 _OLLAMA_MODELS: set[str] | None = None
@@ -101,21 +103,60 @@ class LocalOllamaService:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        endpoint = request.full_url
+        started = time.monotonic()
+        log_request(self.provider_name, self.model, endpoint, self.timeout, system, user)
+        status: Any = "unknown"
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = json.loads(response.read().decode("utf-8"))
+                status = getattr(response, "status", 200)
+                raw_body = response.read()
+            try:
+                body = json.loads(raw_body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                elapsed = time.monotonic() - started
+                parse_error = RuntimeError("Ollama response JSON parsing failed")
+                log_response(self.provider_name, status, raw_body, None, elapsed)
+                log_error(self.provider_name, self.model, endpoint, self.timeout, parse_error, elapsed,
+                          status=status, category="ResponseParsingError")
+                raise parse_error from exc
             if not isinstance(body, dict):
-                raise ValueError("Ollama /api/generate returned an invalid response object")
-        except (TimeoutError, OSError, json.JSONDecodeError, ValueError) as exc:
+                raise RuntimeError("Ollama response parsing failed: expected a JSON object")
+            content = body.get("response")
+            elapsed = time.monotonic() - started
+            log_response(self.provider_name, status, body, content if isinstance(content, str) else None, elapsed)
+            if not isinstance(content, str) or not content.strip():
+                raise log_empty(self.provider_name, self.model, endpoint, self.timeout, elapsed, status=status)
+            content = validate_provider_response(content)
+            return content
+        except Exception as exc:
             global _OLLAMA_READY, _OLLAMA_FAILED_UNTIL
             _OLLAMA_READY = False
             _OLLAMA_FAILED_UNTIL = time.monotonic() + 30
-            LOGGER.warning("Ollama generation failed provider=%s model=%s timeout=%ss type=%s", self.provider_name, self.model, self.timeout, type(exc).__name__)
-            raise RuntimeError(f"Ollama generation failed or timed out ({type(exc).__name__})") from exc
-        content = body.get("response") if isinstance(body, dict) else None
-        return validate_provider_response(content)
+            elapsed = time.monotonic() - started
+            if isinstance(exc, urllib.error.HTTPError):
+                try:
+                    exc.body = exc.read(8192)
+                except Exception:
+                    pass
+                status = exc.code
+            category = error_category(exc, status)
+            if not getattr(exc, "_llm_logged", False):
+                log_error(self.provider_name, self.model, endpoint, self.timeout, exc, elapsed,
+                          status=status, category=category)
+            if isinstance(exc, EmptyResponseError):
+                raise
+            wrapped = RuntimeError(f"Ollama generation failed ({category})")
+            if category == "TimeoutError":
+                wrapped = RuntimeError(f"Ollama generation timed out after {self.timeout} seconds")
+            wrapped.category = category
+            wrapped._llm_logged = True
+            if status != "unknown":
+                wrapped.code = status
+            raise wrapped from exc
 
     def complete_json(self, system: str, user: str, *, max_tokens: int = 1800) -> dict[str, Any]:
+        started = time.monotonic()
         expected = _expected_json_schema(system, user)
         retry_user = user
         errors = []
@@ -131,7 +172,10 @@ class LocalOllamaService:
                     raise
                 errors.append(str(exc))
                 if attempt >= retries:
-                    raise ValueError(f"Ollama returned an empty structured response after {retries} repair attempt(s).") from exc
+                    empty_error = EmptyResponseError(f"Ollama returned an empty structured response after {retries} repair attempt(s).")
+                    log_error(self.provider_name, self.model, f"{self.base_url}/api/generate", self.timeout, empty_error,
+                              time.monotonic() - started, category="EmptyResponseError")
+                    raise empty_error from exc
                 retry_user = (
                     f"{user}\n\nIMPORTANT REPAIR: The previous response was empty. "
                     "Return one complete JSON object matching the required schema, with all required fields."
@@ -141,7 +185,8 @@ class LocalOllamaService:
             error = _validate_json_object(data, expected)
             if error is None:
                 try:
-                    return validate_model_json_contract(validate_llm_output(data), system, user)
+                    result = validate_model_json_contract(validate_llm_output(data), system, user)
+                    return result
                 except ValueError as exc:
                     # The schema check above only checks JSON shape. Domain contracts
                     # (all source IDs, every claim validated, etc.) must get the same
@@ -159,7 +204,11 @@ class LocalOllamaService:
                     "Correct that specific issue. Return exactly one complete JSON object matching the required schema, "
                     f"with all required fields and no Markdown or surrounding text. {correction}"
                 )
-        raise ValueError(f"Ollama returned an invalid structured response after {retries} repair attempt(s): {errors[-1]}")
+        exc = ValueError(f"Ollama returned an invalid structured response after {retries} repair attempt(s): {errors[-1]}")
+        exc.category = "ResponseParsingError"
+        log_error(self.provider_name, self.model, f"{self.base_url}/api/generate", self.timeout, exc,
+                  time.monotonic() - started, category="ResponseParsingError")
+        raise exc
 
 
 def _parse_json_object(content: str) -> dict[str, Any] | None:

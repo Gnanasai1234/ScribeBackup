@@ -407,14 +407,17 @@ def record_history(*, user_id: int, activity_type: str, title: str, status: str,
                    output_text: str | None = None, language: str | None = None,
                    provider: str | None = None, model: str | None = None,
                    error_message: str | None = None, related_document_ids: list[str] | None = None,
-                   extra_data: dict[str, Any] | None = None) -> None:
+                   extra_data: dict[str, Any] | None = None) -> int:
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     with SessionLocal.begin() as session:
-        session.add(HistoryRecord(user_id=user_id, document_id=document_id, activity_type=activity_type,
+        row = HistoryRecord(user_id=user_id, document_id=document_id, activity_type=activity_type,
             title=title, input_text=input_text, output_text=output_text, language=language,
             provider=provider, model=model, status=status, error_message=error_message,
             related_document_ids=_jsonable(related_document_ids) if related_document_ids is not None else None,
-            extra_data=_jsonable(extra_data) if extra_data is not None else None, created_at=now, updated_at=now))
+            extra_data=_jsonable(extra_data) if extra_data is not None else None, created_at=now, updated_at=now)
+        session.add(row)
+        session.flush()
+        return row.id
 
 
 def list_history(user_id: int, *, page: int = 1, limit: int = 20, activity_type: str | None = None) -> list[dict[str, Any]]:

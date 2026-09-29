@@ -31,20 +31,20 @@ class ApiWorkflowTests(unittest.TestCase):
         for item in self.patches:
             item.stop()
 
-    def test_process_persists_actual_openai_gateway_provider_metadata(self):
+    def test_process_persists_actual_openai_provider_metadata(self):
         text = "The board approved a two-year safety pilot. Quarterly inspections will track progress."
         doc = {"id": "openai-summary", "user_id": self.user["id"], "name": "summary.txt", "text": text,
                "pages": [], "chunks": main.make_chunks(text, []), "language": "en", "status": "UPLOADED", "result": None}
         service = type("Service", (), {
-            "provider_metadata": {"name": "openai-gateway", "model": "gpt-4o-mini", "fallback_used": False},
-            "provider_name": "openai-gateway", "model": "gpt-4o-mini",
+            "provider_metadata": {"name": "openai-direct", "model": "gpt-4o-mini", "fallback_used": False},
+            "provider_name": "openai-direct", "model": "gpt-4o-mini",
         })()
         saved = lambda item: DOCS.__setitem__(item["id"], item)
         with patch.object(main, "LLMService", return_value=service), \
              patch.object(main, "summarize_document", return_value={"executive_summary": text, "claims": [], "status": "partial"}), \
              patch.object(main, "save_doc", side_effect=saved):
             result = main.process_document(doc, main.ProcessOptions(summary_depth="quick", language="en"))
-        self.assertEqual(result["provider"], {"name": "openai-gateway", "model": "gpt-4o-mini", "fallback_used": False})
+        self.assertEqual(result["provider"], {"name": "openai-direct", "model": "gpt-4o-mini", "fallback_used": False})
         DOCS.pop(doc["id"], None)
 
     def test_all_generation_providers_failed_uses_labeled_extractive_summary(self):
@@ -53,7 +53,7 @@ class ApiWorkflowTests(unittest.TestCase):
                "pages": [], "chunks": main.make_chunks(text, []), "language": "en", "status": "UPLOADED", "result": None}
         service = type("Service", (), {
             "provider_metadata": {"name": None, "model": None, "fallback_used": True, "fallback_reason": "all providers failed"},
-            "provider_name": "openai-gateway", "model": "gpt-4o-mini",
+            "provider_name": "openai-direct", "model": "gpt-4o-mini",
         })()
         saved = lambda item: DOCS.__setitem__(item["id"], item)
         with patch.object(main, "LLMService", return_value=service), \

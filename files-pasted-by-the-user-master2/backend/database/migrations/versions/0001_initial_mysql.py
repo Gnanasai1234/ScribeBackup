@@ -1,7 +1,15 @@
 """Initial normalized Scribe schema on MySQL."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from alembic import op
+from dotenv import load_dotenv
+
+# Alembic imports revision modules before loading env.py. Load the project
+# settings here so importing Base does not fail when DATABASE_URL is in .env.
+load_dotenv(Path(__file__).resolve().parents[4] / ".env")
+
 from database.connection import Base
 from database import models  # noqa: F401
 

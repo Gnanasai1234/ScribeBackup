@@ -28,7 +28,7 @@ class ValidationFallbackTests(unittest.TestCase):
             "language": "en",
         }
         service = MagicMock(spec=LLMService)
-        service.provider_name = "openai-gateway"
+        service.provider_name = "openai"
         service.model = "mock"
         validation_calls = 0
         regeneration_count = 0

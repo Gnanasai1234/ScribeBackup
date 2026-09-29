@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import sys
 import unittest
@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.llm_service import GeminiProvider, GeminiProviderError, LLMGenerationError, LLMService, OpenAIGatewayProvider, _log_provider_error
+from app.llm_service import LLMGenerationError, LLMService, OpenAIProvider, OpenRouterProvider, _log_provider_error
 from services.local_fallbacks import LocalOllamaService
 
 
@@ -25,10 +25,7 @@ class FakeProvider:
         return self.result
 
     def complete_json(self, *args, **kwargs):
-        self.calls += 1
-        if self.error:
-            raise self.error
-        return self.result
+        return self.complete(*args, **kwargs)
 
 
 class FakeLocal(FakeProvider):
@@ -36,121 +33,147 @@ class FakeLocal(FakeProvider):
 
 
 class LLMServiceTests(unittest.TestCase):
-    def test_gateway_success_skips_gemini_and_ollama(self):
-        gateway = FakeProvider("openai-gateway", "gateway-model", "answer")
-        gemini = FakeProvider("gemini", "gemini-model", "wrong")
+    def test_openrouter_success_skips_openai_and_ollama(self):
+        router = FakeProvider("openrouter", "or-model", "answer")
+        openai_fallback = FakeProvider("openai-direct", "openai-model", "wrong")
         local = FakeLocal("ollama-local", "llama-test", "wrong")
-        service = LLMService(gateway, gemini, local)
+        service = LLMService(router, openai_fallback, local)
         self.assertEqual(service.complete("system", "question"), "answer")
-        self.assertEqual([gateway.calls, gemini.calls, local.calls], [1, 0, 0])
-        self.assertEqual(service.provider_metadata["name"], "openai-gateway")
-        self.assertEqual(service.provider_trace, [{"provider": "openai-gateway", "status": "success"}])
+        self.assertEqual([router.calls, openai_fallback.calls, local.calls], [1, 0, 0])
+        self.assertEqual(service.provider_metadata["name"], "openrouter")
+        self.assertEqual(service.provider_trace, [{"provider": "openrouter", "status": "success"}])
 
-    def test_gateway_failure_uses_gemini_and_skips_ollama(self):
-        gateway = FakeProvider("openai-gateway", "gateway-model", error=TimeoutError("timeout"))
-        gemini = FakeProvider("gemini", "gemini-model", "Gemini answer")
+    def test_openrouter_failure_uses_openai_and_skips_ollama(self):
+        router = FakeProvider("openrouter", "or-model", error=TimeoutError("timeout"))
+        openai_fallback = FakeProvider("openai-direct", "openai-model", "OpenAI answer")
         local = FakeLocal("ollama-local", "llama-test", "wrong")
-        service = LLMService(gateway, gemini, local)
-        self.assertEqual(service.complete("system", "question"), "Gemini answer")
-        self.assertEqual([gateway.calls, gemini.calls, local.calls], [1, 1, 0])
-        self.assertEqual(service.provider_metadata["fallback_reason"], "openai_gateway_failed")
+        service = LLMService(router, openai_fallback, local)
+        self.assertEqual(service.complete("system", "question"), "OpenAI answer")
+        self.assertEqual([router.calls, openai_fallback.calls, local.calls], [1, 1, 0])
+        self.assertEqual(service.provider_metadata["name"], "openai-direct")
+        self.assertTrue(service.provider_metadata["fallback_used"])
+        self.assertEqual(service.provider_metadata["fallback_reason"], "openrouter_failed")
         self.assertEqual([row["status"] for row in service.provider_trace], ["failed", "success"])
 
-    def test_gateway_and_gemini_failure_use_ollama(self):
-        gateway = FakeProvider("openai-gateway", "gateway-model", error=RuntimeError("Gateway unavailable"))
-        gemini = FakeProvider("gemini", "gemini-model", error=RuntimeError("Gemini unavailable"))
+    def test_openrouter_and_openai_failure_use_ollama(self):
+        router = FakeProvider("openrouter", "or-model", error=RuntimeError("unavailable"))
+        openai_fallback = FakeProvider("openai-direct", "openai-model", error=RuntimeError("unavailable"))
         local = FakeLocal("ollama-local", "llama-test", "local answer")
-        service = LLMService(gateway, gemini, local)
+        service = LLMService(router, openai_fallback, local)
         self.assertEqual(service.complete("system", "question"), "local answer")
-        self.assertEqual([gateway.calls, gemini.calls, local.calls], [1, 1, 1])
-        self.assertEqual(service.provider_metadata["fallback_reason"], "openai_gateway_and_gemini_failed")
+        self.assertEqual([router.calls, openai_fallback.calls, local.calls], [1, 1, 1])
+        self.assertEqual(service.provider_metadata["name"], "ollama-local")
+        self.assertEqual(service.provider_metadata["fallback_reason"], "openrouter_and_openai_failed")
         self.assertEqual([row["status"] for row in service.provider_trace], ["failed", "failed", "success"])
 
     def test_empty_output_is_failure_and_advances_chain(self):
-        gateway = FakeProvider("openai-gateway", "gateway-model", "  ")
-        gemini = FakeProvider("gemini", "gemini-model", "usable")
+        router = FakeProvider("openrouter", "or-model", "  ")
+        openai_fallback = FakeProvider("openai-direct", "openai-model", "usable")
         local = FakeLocal("ollama-local", "llama-test", "wrong")
-        service = LLMService(gateway, gemini, local)
+        service = LLMService(router, openai_fallback, local)
         self.assertEqual(service.complete("system", "question"), "usable")
-        self.assertEqual([gateway.calls, gemini.calls, local.calls], [1, 1, 0])
+        self.assertEqual([router.calls, openai_fallback.calls, local.calls], [1, 1, 0])
 
-    def test_all_providers_fail_without_claiming_any_provider_succeeded(self):
-        gateway = FakeProvider("openai-gateway", "gateway-model", error=RuntimeError())
-        gemini = FakeProvider("gemini", "gemini-model", error=RuntimeError())
+    def test_all_providers_fail_without_claiming_success(self):
+        router = FakeProvider("openrouter", "or-model", error=RuntimeError())
+        openai_fallback = FakeProvider("openai-direct", "openai-model", error=RuntimeError())
         local = FakeLocal("ollama-local", "llama-test", error=RuntimeError())
-        service = LLMService(gateway, gemini, local)
+        service = LLMService(router, openai_fallback, local)
         with self.assertRaises(LLMGenerationError):
             service.complete("system", "question")
-        self.assertEqual([gateway.calls, gemini.calls, local.calls], [1, 1, 1])
+        self.assertEqual([router.calls, openai_fallback.calls, local.calls], [1, 1, 1])
         self.assertIsNone(service.provider_metadata["name"])
         self.assertIsNone(service.provider_metadata["model"])
         self.assertEqual([row["status"] for row in service.provider_trace], ["failed", "failed", "failed"])
 
-    def test_gateway_sdk_uses_configured_compatible_base_url(self):
-        with patch.dict("os.environ", {"OPENAI_GATEWAY_URL": "https://keygateway1.arshnivlabs.com/v1", "OPENAI_API_KEY": "test-key"}):
+    def test_openai_provider_uses_native_sdk_endpoint_and_configured_model(self):
+        test_key = "sk-" + "a" * 40
+        with patch.dict("os.environ", {"OPENAI_API_KEY": test_key, "OPENAI_MODEL": "gpt-test"}):
             with patch("openai.OpenAI") as sdk:
-                provider = OpenAIGatewayProvider()
-        sdk.assert_called_once()
-        self.assertEqual(sdk.call_args.kwargs["base_url"], "https://keygateway1.arshnivlabs.com/v1")
-        self.assertEqual(provider.provider_name, "openai-gateway")
-
-    def test_gemini_sdk_uses_configured_model_key_and_timeout(self):
-        fake_client = MagicMock()
-        fake_types = SimpleNamespace(HttpOptions=MagicMock(return_value="http-options"))
-        fake_genai = SimpleNamespace(Client=MagicMock(return_value=fake_client))
-        fake_google = MagicMock(genai=fake_genai)
-        fake_genai_module = MagicMock(types=fake_types)
-        with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key", "GEMINI_MODEL": "gemini-test", "GEMINI_TIMEOUT_SECONDS": "12"}):
-            with patch.dict(sys.modules, {"google": fake_google, "google.genai": fake_genai_module}):
-                provider = GeminiProvider()
-        fake_genai.Client.assert_called_once_with(api_key="test-key", http_options="http-options")
-        self.assertEqual(provider.provider_name, "gemini")
-        self.assertEqual(provider.model, "gemini-test")
-        self.assertEqual(provider.timeout, 12.0)
-
-    def test_gemini_complete_uses_model_and_rejects_empty_sdk_responses(self):
-        fake_client = MagicMock()
-        fake_client.models.generate_content.return_value = SimpleNamespace(text=" GEMINI_TEST_OK ")
-        fake_types = SimpleNamespace(
-            HttpOptions=MagicMock(return_value="http-options"),
-            GenerateContentConfig=MagicMock(return_value="generation-config"),
+                provider = OpenAIProvider()
+        sdk.assert_called_once_with(
+            api_key=test_key,
+            base_url="https://api.openai.com/v1",
+            timeout=30.0,
+            max_retries=0,
         )
-        fake_genai = SimpleNamespace(Client=MagicMock(return_value=fake_client))
-        fake_google = MagicMock(genai=fake_genai)
-        fake_genai_module = MagicMock(types=fake_types)
-        env = {"GEMINI_API_KEY": "test-key", "GEMINI_MODEL": "gemini-test"}
-        with patch.dict("os.environ", env):
-            with patch.dict(sys.modules, {"google": fake_google, "google.genai": fake_genai_module}):
-                provider = GeminiProvider()
-                result = provider.complete("Return the token", "Reply with exactly: GEMINI_TEST_OK")
-                self.assertEqual(result, "GEMINI_TEST_OK")
-                self.assertEqual(fake_client.models.generate_content.call_args.kwargs["model"], "gemini-test")
-                self.assertIn("GEMINI_TEST_OK", fake_client.models.generate_content.call_args.kwargs["contents"])
-                fake_client.models.generate_content.return_value = SimpleNamespace(text="")
-                with self.assertRaises(GeminiProviderError) as raised:
-                    provider.complete("Return a token", "test")
-                self.assertEqual(raised.exception.category, "MalformedResponse")
+        self.assertEqual(provider.base_url, "https://api.openai.com/v1")
+        self.assertEqual(provider.model, "gpt-test")
+        self.assertEqual(provider.provider_name, "openai-direct")
 
-    def test_gemini_response_parts_and_safety_errors(self):
-        from app.llm_service import _gemini_response_text
-        candidate = SimpleNamespace(finish_reason="STOP", content=SimpleNamespace(parts=[SimpleNamespace(text="Part response")]))
-        self.assertEqual(_gemini_response_text(SimpleNamespace(text=None, candidates=[candidate])), "Part response")
-        blocked = SimpleNamespace(text=None, prompt_feedback=SimpleNamespace(block_reason="SAFETY"), candidates=[])
-        with self.assertRaises(GeminiProviderError) as raised:
-            _gemini_response_text(blocked)
-        self.assertEqual(raised.exception.category, "SafetyBlock")
+    def test_placeholder_key_is_rejected_without_constructing_client(self):
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "placeholder-key", "OPENAI_BASE_URL": "https://proxy.invalid/v1"}):
+            with patch("openai.OpenAI") as sdk:
+                provider = OpenAIProvider()
+        sdk.assert_not_called()
+        self.assertIsNone(provider.client)
+        self.assertEqual(provider.base_url, "https://api.openai.com/v1")
+        self.assertIn("placeholder/test", provider.config_error)
 
-    def test_gemini_service_unavailable_log_is_specific_and_sanitized(self):
-        error = RuntimeError("transient provider response contained private detail")
+    def test_openrouter_uses_openrouter_endpoint_and_model(self):
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key", "OPENROUTER_MODEL": "test/model"}):
+            with patch("openai.OpenAI") as sdk:
+                provider = OpenRouterProvider()
+        sdk.assert_called_once()
+        self.assertEqual(sdk.call_args.kwargs["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(provider.model, "test/model")
+        self.assertEqual(provider.provider_name, "openrouter")
+
+    def test_real_provider_boundary_logs_request_sizes_response_and_success_without_prompt(self):
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="TEST_OK"))],
+            _response=SimpleNamespace(status_code=200),
+        )
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}), patch("openai.OpenAI") as sdk:
+            sdk.return_value = fake_client
+            provider = OpenRouterProvider()
+        openai_fallback = FakeProvider("openai-direct", "openai-model", "unused")
+        service = LLMService(provider, openai_fallback, FakeLocal("ollama-local", "llama-test", "unused"))
+        with self.assertLogs("scribe.llm", level="INFO") as captured:
+            self.assertEqual(service.complete("safe instructions", "CONFIDENTIAL_DOCUMENT_CONTENT", max_tokens=8), "TEST_OK")
+        output = "\n".join(captured.output)
+        self.assertIn("[LLM REQUEST] provider=openrouter", output)
+        self.assertIn("input_characters=", output)
+        self.assertIn("prompt_characters=", output)
+        self.assertIn("estimated_tokens=", output)
+        self.assertIn("[LLM RESPONSE] provider=openrouter status=200", output)
+        self.assertIn("usable=true", output)
+        self.assertIn("[LLM SUCCESS] provider=openrouter", output)
+        self.assertIn("elapsed=", output)
+        self.assertNotIn("CONFIDENTIAL_DOCUMENT_CONTENT", output)
+
+    def test_empty_provider_response_is_logged_and_falls_back(self):
+        fake_client = MagicMock()
+        fake_client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=None))],
+            _response=SimpleNamespace(status_code=200),
+        )
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}), patch("openai.OpenAI") as sdk:
+            sdk.return_value = fake_client
+            provider = OpenRouterProvider()
+        openai_fallback = FakeProvider("openai-direct", "openai-model", "OpenAI answer")
+        service = LLMService(provider, openai_fallback, FakeLocal("ollama-local", "llama-test", "unused"))
+        with self.assertLogs("scribe.llm", level="INFO") as captured:
+            self.assertEqual(service.complete("system", "question"), "OpenAI answer")
+        output = "\n".join(captured.output)
+        self.assertIn("error_type=EmptyResponseError", output)
+        self.assertIn("[LLM FALLBACK] from=openrouter to=openai-direct", output)
+        self.assertEqual(service.provider_metadata["name"], "openai-direct")
+
+    def test_error_log_is_categorized_and_sanitized(self):
+        error = RuntimeError("provider rejected credential sk-test-secret-value-12345")
         error.code = 503
-        provider = FakeProvider("gemini", "gemini-model")
-        provider.timeout = 45
-        with self.assertLogs("scribe.llm", level="ERROR") as captured:
-            _log_provider_error("gemini", provider, error)
+        provider = FakeProvider("openrouter", "test-model")
+        provider.timeout = 30
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-test-secret-value-12345"}):
+            with self.assertLogs("scribe.llm", level="ERROR") as captured:
+                _log_provider_error("openrouter", provider, error)
         output = "\n".join(captured.output)
         self.assertIn("error_type=ServiceUnavailable", output)
         self.assertIn("status=503", output)
-        self.assertNotIn("private detail", output)
+        self.assertNotIn("sk-test-secret-value-12345", output)
+        self.assertIn("[REDACTED]", output)
 
     def test_ollama_timeout_is_bounded_and_configurable(self):
         with patch.dict("os.environ", {"OLLAMA_TIMEOUT_SECONDS": "120"}):
@@ -161,3 +184,4 @@ class LLMServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

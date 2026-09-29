@@ -1,30 +1,30 @@
 # LLM configuration
 
-All general-purpose text generation uses one backend-only provider router. The strict order is **OpenAI Gateway → Gemini → Ollama Local** for summarization, claim validation, translation, audio-script translation, document comparison, and evidence-grounded answers. Frontend requests cannot select providers.
+All general-purpose text generation uses one backend-only provider router with a fixed order: **OpenRouter ? API Gateway ? Ollama Local**. Summarization, claim validation, translation, audio-script translation, document comparison, evidence-grounded answers, evaluation, and the LLM Provider Test all use this router. Frontend requests cannot select a provider or change the order.
 
 ## Configuration
 
-Set these in the backend environment. Keys are never logged or sent to the frontend.
+Set these in the backend environment. Credentials are never logged or sent to the frontend.
 
 | Variable | Default / purpose |
 |---|---|
-| `OPENAI_GATEWAY_URL` | `https://keygateway1.arshnivlabs.com/v1` (OpenAI-compatible base URL) |
-| `OPENAI_API_KEY` | Gateway credential; `OPENAI_GATEWAY_API_KEY` remains a compatibility alias |
+| `OPENROUTER_API_KEY` | OpenRouter credential |
+| `OPENROUTER_MODEL` | `openai/gpt-4o-mini` |
+| `OPENROUTER_TIMEOUT_SECONDS` | 30 seconds, bounded to 5?90 |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` (custom values are rejected) |
+| `OPENAI_API_KEY` | Direct OpenAI API credential; placeholders are rejected |
 | `OPENAI_MODEL` | `gpt-4o-mini` |
-| `OPENAI_TIMEOUT_SECONDS` | 30 seconds, bounded to 5–90 |
-| `GEMINI_API_KEY` | Gemini Developer API credential |
-| `GEMINI_MODEL` | `gemini-3.8-flash` |
-| `GEMINI_TIMEOUT_SECONDS` | 45 seconds, bounded to 5–90 |
+| `OPENAI_TIMEOUT_SECONDS` | 30 seconds, bounded to 5?90 |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` |
 | `OLLAMA_MODEL` | `llama3.2:1b` |
-| `OLLAMA_TIMEOUT_SECONDS` | 45 seconds, bounded to 5–90 |
+| `OLLAMA_TIMEOUT_SECONDS` | 45 seconds, bounded to 5?90 |
 
-The Gateway uses the OpenAI SDK pointed at its configured compatible URL. Gemini uses Google's `google-genai` SDK (`google-genai>=1.0,<2`), initialized with `GEMINI_API_KEY`; `GEMINI_TIMEOUT_SECONDS` controls its SDK HTTP timeout independently of Ollama. The model name is read only from `GEMINI_MODEL`. Ollama uses only already-installed models and never pulls a model.
+General LLM generation uses one router in this order: OpenRouter, Direct OpenAI at `https://api.openai.com/v1`, then local Ollama. The OpenAI key is backend-only. Missing or placeholder keys are not sent; the service logs a safe configuration error and continues to Ollama. When every model provider fails, document summaries may use the existing deterministic extractive fallback. Ollama uses only an already-installed model and never pulls one automatically.
 
-The router attempts the Gateway first, then Gemini, then Ollama. A provider is skipped only after a previous provider returns usable output. Empty, blocked, malformed, or invalid output counts as failure. Metadata identifies the actual successful provider, model, and fallback reason. Failures log provider, model, status when available, categorized exception type, safe error details, and timeout, without credentials, request contents, or response bodies.
+A provider succeeds only when it returns non-empty, valid output. The router records the provider, model, fallback reason, and providers actually attempted. Errors retain their original exception internally and log safe categories, status when available, and error types, without credentials, prompts, or response bodies.
 
-When all three providers fail, document summaries may use the deterministic extractive fallback, explicitly tagged `deterministic-extractive`. Evidence-grounded Q&A does not fabricate a response and returns its controlled failure. Translation preserves original-language content and exposes a warning when no provider can produce a valid translation.
+When all providers fail, document summaries may use the existing deterministic extractive fallback, labeled `deterministic-extractive`. Evidence-grounded Q&A does not fabricate a response. Failed translation preserves the source text and reports the failure.
 
-`POST /api/llm/diagnostics` is an authenticated, explicit diagnostic that probes each provider separately. It reports safe key presence, request state, response state, and categorized errors, never credentials. It is not run at startup. `/api/health` reports non-generative configuration and local availability only. `POST /api/llm/test` uses the same priority chain and returns the provider execution trace. `/api/local-llm/test` remains an authenticated compatibility alias.
+`POST /api/llm/diagnostics` is an authenticated, explicit generation probe. It independently tests OpenRouter with `OPENROUTER_TEST_OK`, Direct OpenAI with `OPENAI_DIRECT_TEST_OK`, and Ollama with `OLLAMA_TEST_OK`; normal startup performs no generation probes. `/api/health` reports safe configuration and local availability only. `POST /api/llm/test` uses the shared priority chain and returns the actual provider execution trace. `/api/local-llm/test` remains an authenticated compatibility alias.
 
-Embedding providers are configured separately and are not generative LLMs. Specialized speech-to-text and text-to-speech services also remain separate from general-purpose LLM routing.
+Embeddings are a separate capability and may use their own configured provider. Specialized speech-to-text and text-to-speech services also remain separate from general-purpose LLM routing.
